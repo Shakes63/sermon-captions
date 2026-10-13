@@ -38,7 +38,21 @@ The first time you make captions, the app downloads a 1.6 GB speech model.
 
 - Each sermon gets a folder in `~/Movies/Sermon Captions/`, named after the English video.
 - The speech models live in `~/Library/Application Support/Sermon Captions/`.
-- Music removal and voice repair save their work in `~/Library/Caches/Sermon Captions/`, so a second save of the same sermon is quick.
+- Music removal, voice repair and Auto color save their work in `~/Library/Caches/Sermon Captions/`, so a second save of the same sermon is quick. When the app opens, it deletes anything there that hasn't been used in a month.
+
+## Copying to ProPresenter
+
+Step 3 can copy the finished Spanish video straight to the ProPresenter Mac,
+into its `Movies/Spanish sermons` folder. It goes over the church network
+when you're there, and over Tailscale when you're not. The checkbox and the
+Copy to ProPresenter button only show up on a Mac that's been set up for it.
+
+Setting up a Mac gives that copy of the app its own SSH key, kept in
+`~/Library/Application Support/Sermon Captions/ProPresenter/` with a
+`config.json` that says where the ProPresenter Mac is. On the ProPresenter
+Mac, that key can only run `propresenter-receive.sh`, which saves one `.mp4`
+into that folder and does nothing else. Jacob has the setup script, since it
+names the church's machines.
 
 ## Building it
 

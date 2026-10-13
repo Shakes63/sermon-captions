@@ -24,6 +24,33 @@ enum Paths {
     static let musicCache = home.appendingPathComponent("Library/Caches/Sermon Captions/Music")
     static let colorCache = home.appendingPathComponent("Library/Caches/Sermon Captions/Color")
     static let repairCache = home.appendingPathComponent("Library/Caches/Sermon Captions/Repair")
+    static let caches = home.appendingPathComponent("Library/Caches/Sermon Captions")
+    /// Set up per Mac (see sermon_captions.py `send`); without it there's no copying to ProPresenter.
+    static let proPresenter = home.appendingPathComponent("Library/Application Support/Sermon Captions/ProPresenter")
+    static var canCopyToProPresenter: Bool {
+        FileManager.default.fileExists(atPath: proPresenter.appendingPathComponent("config.json").path)
+    }
+
+    /// Music, voice repairs and color looks nobody has made or used in a month.
+    /// They're only there to make a second save of the same sermon quick.
+    /// A WAV and its ".ref" go together, by whichever was used last.
+    static func cleanCaches() {
+        let fm = FileManager.default
+        let old = Date().addingTimeInterval(-30 * 86400)
+        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey, .contentAccessDateKey]
+        guard let files = fm.enumerator(at: caches, includingPropertiesForKeys: keys) else { return }
+        var groups: [String: (used: Date, files: [URL])] = [:]
+        for case let f as URL in files {
+            guard let v = try? f.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
+            let used = max(v.contentModificationDate ?? .distantPast, v.contentAccessDate ?? .distantPast)
+            let key = f.pathExtension == "ref" ? f.deletingPathExtension().path : f.path
+            let g = groups[key] ?? (.distantPast, [])
+            groups[key] = (max(g.used, used), g.files + [f])
+        }
+        for g in groups.values where g.used < old {
+            g.files.forEach { try? fm.removeItem(at: $0) }
+        }
+    }
 
     static func missing() -> [String] {
         let needed = [python, script, resources.appendingPathComponent("models/htdemucs.safetensors")]
@@ -66,7 +93,7 @@ final class LineReader {
 
 @MainActor
 final class Model: ObservableObject {
-    enum Job { case trim, music, repair, suggest, english, spanish }
+    enum Job { case trim, music, repair, suggest, english, spanish, copy }
 
     /// The untrimmed video, straight from Subsplash.
     @Published var sourceVideo: URL? { didSet { sourceChanged(from: oldValue) } }
@@ -94,6 +121,7 @@ final class Model: ObservableObject {
                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.process?.terminate() }
         }
+        DispatchQueue.global(qos: .utility).async { Paths.cleanCaches() }
     }
     private var stderrTail: [String] = []
     private var lastError: String?
@@ -103,6 +131,16 @@ final class Model: ObservableObject {
     private var trimMadeCaptions = false
     /// Where the running repair writes.
     private var repairOut: URL?
+    /// Where the copy job put the video on the ProPresenter Mac.
+    private var lastNote: String?
+    /// How long making the Spanish video took, when copying follows it.
+    private var spanishTook: String?
+
+    /// "Copy it to the ProPresenter Mac" in step 3 (on unless turned off).
+    static let copyToProPresenterKey = "copyToProPresenter"
+    static var copyToProPresenter: Bool {
+        UserDefaults.standard.object(forKey: copyToProPresenterKey) as? Bool ?? true
+    }
 
     /// "Also make the English captions" in the trim window (on unless turned off).
     static let captionsWithTrimKey = "captionsWithTrim"
@@ -308,6 +346,11 @@ final class Model: ObservableObject {
         run(.spanish, ["spanish", o.path, s.path, en.path, srt.path, mp4.path], in: mp4.deletingLastPathComponent())
     }
 
+    func copyToProPresenter() {
+        guard let mp4 = spanishOut, job == nil, Paths.canCopyToProPresenter else { return }
+        run(.copy, ["send", mp4.path], in: mp4.deletingLastPathComponent())
+    }
+
     /// Replace the English captions with an SRT the user edited elsewhere.
     func importEnglishSRT(_ url: URL) {
         guard let dest = englishSRTPath, url.standardizedFileURL != dest.standardizedFileURL else { return }
@@ -358,6 +401,7 @@ final class Model: ObservableObject {
         stderrTail = []
         lastError = nil
         lastWarning = nil
+        lastNote = nil
         cancelled = false
         readers = [
             LineReader(out.fileHandleForReading) { line in
@@ -397,6 +441,7 @@ final class Model: ObservableObject {
         case "PROGRESS": progress = Double(rest) ?? progress
         case "ERROR": lastError = rest
         case "WARN": lastWarning = rest
+        case "NOTE": lastNote = rest
         default: break
         }
     }
@@ -409,11 +454,15 @@ final class Model: ObservableObject {
         // Sections a stopped or failed separation did finish still count.
         if which == .music || which == .repair { trim?.refreshMusic() }
         // Repair the voice was turned on (or the music changed) while
-        // something else was running: start it now.
-        if !cancelled, status == 0, which != .repair, let c = trim, c.repair, c.repairNeeded, !c.musicNeedsSeparating {
+        // something else was running: start it now (after the copy to ProPresenter, if one is next).
+        let copyNext = which == .spanish && !cancelled && status == 0
+            && Paths.canCopyToProPresenter && Self.copyToProPresenter
+        if !cancelled, status == 0, which != .repair, !copyNext, let c = trim, c.repair, c.repairNeeded, !c.musicNeedsSeparating {
             DispatchQueue.main.async { [weak self] in self?.repairVoice() }
         }
+        if which != .copy { spanishTook = nil }
         if cancelled {
+            spanishTook = nil
             show("Stopped.")
         } else if status == 0 {
             let took = Int(Date().timeIntervalSince(started))
@@ -443,10 +492,25 @@ final class Model: ObservableObject {
                 show("English captions are ready (\(time)). Check them over, then upload the SRT to HeyGen.")
             case .spanish:
                 show("The Spanish video with English captions is ready (\(time)).")
+                if copyNext {
+                    spanishTook = time
+                    DispatchQueue.main.async { [weak self] in self?.copyToProPresenter() }
+                }
+            case .copy:
+                let place = lastNote.map { " in \($0.replacingOccurrences(of: "/", with: " › "))" } ?? ""
+                if let took = spanishTook {
+                    show("The Spanish video with English captions is ready (\(took)) and copied to the ProPresenter Mac\(place).")
+                } else {
+                    show("Copied to the ProPresenter Mac\(place).")
+                }
+                spanishTook = nil
             }
         } else {
-            show(lastError ?? stderrTail.joined(separator: "\n").ifEmpty("Something went wrong (exit \(status))."),
+            let why = lastError ?? stderrTail.joined(separator: "\n").ifEmpty("Something went wrong (exit \(status)).")
+            // The Spanish video itself is fine when only the copy failed.
+            show(spanishTook != nil ? "The Spanish video with English captions is ready, but it didn't get to ProPresenter. \(why)" : why,
                  error: true)
+            spanishTook = nil
         }
     }
 }
@@ -460,6 +524,7 @@ extension String {
 struct ContentView: View {
     @ObservedObject var model: Model
     @Environment(\.openWindow) private var openWindow
+    @AppStorage(Model.copyToProPresenterKey) private var copyToProPresenter = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -540,8 +605,17 @@ struct ContentView: View {
                     }
                     Spacer()
                 }
+                if Paths.canCopyToProPresenter {
+                    Toggle("Copy it to the ProPresenter Mac when it's done", isOn: $copyToProPresenter)
+                        .font(.callout)
+                }
                 if model.spanishSRT != nil || model.spanishOut != nil {
                     HStack(spacing: 12) {
+                        if model.spanishOut != nil && Paths.canCopyToProPresenter {
+                            Button("Copy to ProPresenter") { model.copyToProPresenter() }
+                                .disabled(model.job != nil)
+                                .help("Copies this video to the ProPresenter Mac's Movies › Spanish sermons folder.")
+                        }
                         Spacer()
                         if let srt = model.spanishSRT { FileTile(url: srt, label: "Captions – Spanish timing") }
                         if let mp4 = model.spanishOut { FileTile(url: mp4, label: "Spanish video with captions") }

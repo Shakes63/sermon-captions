@@ -44,8 +44,12 @@
       translation, by matching frames between the two videos, then burn
       the retimed captions into SPANISH.
 
+  sermon_captions.py send VIDEO
+      Copy the finished video to the ProPresenter Mac, as set up in
+      ~/Library/Application Support/Sermon Captions/ProPresenter/.
+
 Progress goes to stdout, one message per line, for the app to read:
-  STAGE <text>   PROGRESS <0..1>   WARN <text>   ERROR <text>   DONE
+  STAGE <text>   PROGRESS <0..1>   WARN <text>   NOTE <text>   ERROR <text>   DONE
 """
 import os
 import re
@@ -544,6 +548,120 @@ def spanish(orig, copy, en_srt, out_srt, out_mp4):
         finally:
             if os.path.exists(partial):
                 os.remove(partial)
+
+
+# Copying the finished video to the ProPresenter Mac. config.json there says
+# where it is: {"host", "user", "jump"} for another Mac, reached directly when
+# on the church network and through "jump" (over Tailscale) when not, or
+# {"folder"} when this is the ProPresenter Mac. "key" and "known_hosts" sit
+# next to it. On the ProPresenter Mac the key may only run the receive
+# script, and on the jump host it may only connect through to it.
+SEND_DIR = os.path.expanduser("~/Library/Application Support/Sermon Captions/ProPresenter")
+
+
+def send_config():
+    import json
+    try:
+        return json.load(open(os.path.join(SEND_DIR, "config.json")))
+    except (OSError, ValueError):
+        fail("Copying to ProPresenter isn't set up on this Mac.")
+
+
+def ssh_args(cfg, via_jump):
+    # Quoted because the folder has spaces, and ssh would read them as a list of files.
+    # -F /dev/null: none of this Mac's own ssh settings apply.
+    opts = ["-F", "/dev/null", "-i", os.path.join(SEND_DIR, "key"), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+            "-o", 'UserKnownHostsFile="%s"' % os.path.join(SEND_DIR, "known_hosts"),
+            "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=6",
+            "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"]
+    # The host key is checked under a fixed name, so the same address on
+    # another network (another campus uses the same numbers) is refused.
+    target = opts + ["-o", "HostKeyAlias=" + cfg.get("alias", "propresenter")]
+    if via_jump:
+        import shlex
+        jump = " ".join(shlex.quote(a) for a in ["/usr/bin/ssh", *opts, "-W", "%h:%p", cfg["jump"]])
+        target += ["-o", "ProxyCommand=" + jump]
+    return ["/usr/bin/ssh", *target, f"{cfg['user']}@{cfg['host']}"]
+
+
+def send(video):
+    if not os.path.exists(video):
+        fail(f"Can't find {video}")
+    name = os.path.basename(video)
+    size = os.path.getsize(video)
+    cfg = send_config()
+    if "folder" in cfg:
+        P.stage("Copying to ProPresenter…", 0.0, 1.0)
+        folder = os.path.expanduser(cfg["folder"])
+        os.makedirs(folder, exist_ok=True)
+        fd, part = tempfile.mkstemp(prefix=".upload.", dir=folder)
+        try:
+            with open(video, "rb") as src, os.fdopen(fd, "wb") as dst:
+                done = 0
+                while chunk := src.read(4 << 20):
+                    dst.write(chunk)
+                    done += len(chunk)
+                    P.set(done / size)
+            os.chmod(part, 0o644)
+            os.replace(part, os.path.join(folder, name))
+        finally:
+            if os.path.exists(part):
+                os.remove(part)
+        emit("NOTE", cfg["folder"].replace("~/", "", 1))
+        return
+
+    P.stage("Finding the ProPresenter Mac…", 0.0, 0.0)
+    routes = [False, True] if cfg.get("jump") else [False]
+    found = None
+    for via_jump in routes:
+        try:
+            r = subprocess.run(ssh_args(cfg, via_jump) + ["check"], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            continue
+        if r.returncode == 0 and r.stdout.startswith("ok"):
+            found, reply = via_jump, r.stdout.split()
+            break
+    if found is None:
+        fail("Couldn't reach the ProPresenter Mac. It may be asleep or turned off. Away from church, "
+             "this Mac also needs Tailscale turned on. The video is still in this sermon's folder, "
+             "so you can try again with Copy to ProPresenter.")
+    if len(reply) > 1 and reply[1].isdigit() and int(reply[1]) * 1024 < size + (2 << 30):
+        fail("The ProPresenter Mac is almost out of space.")
+
+    P.stage("Copying to ProPresenter…", 0.0, 1.0)
+    proc = subprocess.Popen(ssh_args(cfg, found) + [f"upload {size} {name}"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
+    CHILDREN.append(proc)
+    # Read its replies while sending, so a chatty ssh can't fill a pipe and stall both sides.
+    replies = {}
+    readers = [threading.Thread(target=lambda k, f: replies.__setitem__(k, f.read()[-4000:]), args=(k, f), daemon=True)
+               for k, f in (("out", proc.stdout), ("err", proc.stderr))]
+    for t in readers:
+        t.start()
+    try:
+        with open(video, "rb") as src:
+            done = 0
+            while chunk := src.read(1 << 20):
+                proc.stdin.write(chunk)
+                done += len(chunk)
+                P.set(done / size)
+    except BrokenPipeError:
+        pass   # the other end gave up; its message comes next
+    try:
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    proc.wait()
+    for t in readers:
+        t.join()
+    out, err = replies.get("out", b""), replies.get("err", b"")
+    out = out.decode(errors="replace").strip()
+    if proc.returncode != 0 or not out.startswith("saved "):
+        why = err.decode(errors="replace").strip().splitlines()
+        fail("Copying to the ProPresenter Mac stopped partway" + (f" ({why[-1]})" if why else "")
+             + ". Try again with Copy to ProPresenter.")
+    emit("NOTE", out[len("saved "):])
 
 
 FADE_SECONDS = 1.0
@@ -1551,13 +1669,15 @@ def main():
         transcribe(*sys.argv[2:])
     elif len(sys.argv) == 7 and sys.argv[1] == "spanish":
         spanish(*sys.argv[2:])
+    elif len(sys.argv) == 3 and sys.argv[1] == "send":
+        send(sys.argv[2])
     else:
         fail("usage: trim [--captions OUT.srt] [--repair VOICE.wav FROM] VIDEO OUT.mp4 START LENGTH FADE LEVEL LOOK.cube "
              "[MUSIC.wav AT AMOUNT]... | "
              "repair VIDEO START LENGTH OUT.wav [MUSIC.wav AT AMOUNT]... | "
              "separate VIDEO FROM TO OUT.wav [FROM TO OUT.wav]... | suggest VIDEO OUT.json | "
              "transcribe VIDEO OUT.srt | "
-             "spanish ORIG SPANISH EN.srt OUT.srt OUT.mp4")
+             "spanish ORIG SPANISH EN.srt OUT.srt OUT.mp4 | send VIDEO")
     emit("DONE")
 
 
