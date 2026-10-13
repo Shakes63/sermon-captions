@@ -16,7 +16,7 @@ fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-echo "Downloading Sermon Captions (about 1 GB)..."
+echo "Downloading Sermon Captions..."
 curl -fL --progress-bar "$URL" -o "$TMP/app.zip"
 ditto -x -k "$TMP/app.zip" "$TMP"
 [ -d "$TMP/Sermon Captions.app" ] || { echo "The download didn't contain the app. Nothing was changed."; exit 1; }

@@ -17,7 +17,7 @@ Quit the app if it's open, then paste this into Terminal:
 curl -fsSL https://raw.githubusercontent.com/Shakes63/sermon-captions/main/install.sh | bash
 ```
 
-That downloads the latest version (about 1 GB) and puts it in your home
+That downloads the latest version (about 330 MB) and puts it in your home
 folder's Applications folder, replacing the old copy. Your sermons and
 settings stay where they are. The version number is in the bottom left of the
 app's window.
