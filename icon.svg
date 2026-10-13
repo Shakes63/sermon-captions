@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="100 100 824 824">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7875A"/>
+      <stop offset="1" stop-color="#E45A2B"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2A2E37"/>
+      <stop offset="1" stop-color="#15171C"/>
+    </linearGradient>
+    <linearGradient id="person" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5A616E"/>
+      <stop offset="1" stop-color="#3A3F49"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.30"/>
+    </filter>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#7A2A0C" flood-opacity="0.45"/>
+    </filter>
+    <linearGradient id="band" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000" stop-opacity="0"/>
+      <stop offset="0.45" stop-color="#000" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.6"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.18"/>
+      <stop offset="0.5" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="clip"><rect x="172" y="300" width="680" height="424" rx="44"/></clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" fill="url(#gloss)"/>
+  <rect x="172" y="300" width="680" height="424" rx="44" fill="url(#screen)" filter="url(#soft)"/>
+  <rect x="173.5" y="301.5" width="677" height="421" rx="42.5" fill="none" stroke="#fff" stroke-opacity="0.10" stroke-width="3"/>
+  <g clip-path="url(#clip)">
+    <circle cx="512" cy="430" r="62" fill="url(#person)"/>
+    <path d="M352 724 C352 590 420 520 512 520 C604 520 672 590 672 724 Z" fill="url(#person)"/>
+    <rect x="172" y="540" width="680" height="184" fill="url(#band)"/>
+  </g>
+  <g fill="#FFFFFF">
+    <rect x="262" y="610" width="118" height="30" rx="15"/>
+    <rect x="394" y="610" width="70"  height="30" rx="15"/>
+    <rect x="478" y="610" width="150" height="30" rx="15"/>
+    <rect x="642" y="610" width="120" height="30" rx="15"/>
+    <rect x="322" y="658" width="96"  height="30" rx="15"/>
+    <rect x="432" y="658" width="160" height="30" rx="15"/>
+    <rect x="606" y="658" width="96"  height="30" rx="15"/>
+  </g>
+</svg>
