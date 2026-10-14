@@ -613,6 +613,18 @@ def clean_srt(text):
             drop.add(k - 1)
             if a[:1].isupper() and not b[:1].isupper():
                 words[k][3] = b[0].upper() + b[1:]
+    # Always capitalized: Scripture(s), Word of God, God's Word.
+    alive = [w for k, w in enumerate(words) if k not in drop]
+    plain = [core(w[3].replace("\u2019", "'")).strip("'") for w in alive]
+    ends = [bool(re.search(r"[.?!,;:]\W*$", w[3])) for w in alive]   # the phrase can't run past these
+    up = lambda w: re.sub(r"^(\W*)([a-z])", lambda m: m.group(1) + m.group(2).upper(), w)
+    for k, w in enumerate(alive):
+        if plain[k] in ("scripture", "scriptures", "scripture's"):
+            w[3] = up(w[3])
+        elif plain[k] == "word" and plain[k + 1:k + 3] == ["of", "god"] and not any(ends[k:k + 2]):
+            w[3], alive[k + 2][3] = up(w[3]), up(alive[k + 2][3])
+        elif plain[k] == "word" and k and plain[k - 1] == "god's" and not ends[k - 1]:
+            w[3], alive[k - 1][3] = up(w[3]), up(alive[k - 1][3])
     rebuilt = [[[] for _ in cue[1]] for cue in cues]
     for k, (ci, li, wi, w) in enumerate(words):
         if k not in drop:
