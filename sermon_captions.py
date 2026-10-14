@@ -84,11 +84,34 @@ REPAIR_FILES = ["hparams.yaml", "ds/G/latest", "ds/G/default/mp_rank_00_model_st
 MUSIC_RAMP = 1.0        # seconds to fade the change in and out
 
 WHISPER_PROMPT = "HighRidge Church sermon."
+# A sample of the house style: names, and "He" and "His" for God. With it in
+# mind throughout (--carry-initial-prompt), Whisper capitalizes the pronouns
+# only where they mean God, but its timing gets coarse (often whole seconds).
+# So captions come from a pass with the short prompt, and a second pass with
+# this one only says which pronouns to capitalize. No Bible references in it:
+# with "John 3:16" there, it once wrote a reference nobody said.
+CAPTION_PROMPT = ("HighRidge Church sermon by Pastor Zach Gryder. God loves you, and He sent His Son. "
+                  "Jesus said He is the way; follow Him. The pool of Bethesda. Not an iota. Bring the tithe. "
+                  "Pastor Kyle Fischer, Grace Nguyen, Kaitlin, Miranda, Arrow.")
 WORD_FIXES = [
     (r"\bHigh Ridge\b", "HighRidge"),
     (r"\bHighridge\b", "HighRidge"),
     (r"\bEspanol\b", "Español"),
+    (r"\bHoward Church\b", "HighRidge Church"),
+    (r"\bGr(?:i|ei|ey)der\b", "Gryder"),
+    (r"\b(?:Caitlin|Caitlyn|Katelyn|Kaitlyn)\b", "Kaitlin"),
+    (r"\b(?:aota|aoda)\b", "iota"),
 ]
+BOOKS = {
+    "genesis", "exodus", "leviticus", "numbers", "deuteronomy", "joshua", "judges", "ruth", "samuel",
+    "kings", "chronicles", "ezra", "nehemiah", "esther", "job", "psalm", "psalms", "proverbs",
+    "ecclesiastes", "isaiah", "jeremiah", "lamentations", "ezekiel", "daniel", "hosea", "joel", "amos",
+    "obadiah", "jonah", "micah", "nahum", "habakkuk", "zephaniah", "haggai", "zechariah", "malachi",
+    "matthew", "mark", "luke", "john", "acts", "romans", "corinthians", "galatians", "ephesians",
+    "philippians", "colossians", "thessalonians", "timothy", "titus", "philemon", "hebrews", "james",
+    "peter", "jude", "revelation", "revelations"}
+ORDINALS = {"1": "1", "2": "2", "3": "3", "first": "1", "second": "2", "third": "3",
+            "1st": "1", "2nd": "2", "3rd": "3"}
 STYLE = ("FontName=Helvetica Neue,Bold=1,FontSize=18,BorderStyle=3,"
          "Outline=2,Shadow=0,BackColour=&H80000000,MarginV=28")
 
@@ -236,13 +259,13 @@ def ensure_model():
     return 0.5
 
 
-def whisper(wav, out_base, max_len, extra=(), on_frac=None):
+def whisper(wav, out_base, max_len, extra=(), on_frac=None, captions=False):
     """Whisper to OUT_BASE.srt, reporting progress on the current stage
-    (or to on_frac)."""
+    (or to on_frac). CAPTIONS: with the house-style prompt."""
     on_frac = on_frac or P.set
+    prompt = ["--prompt", CAPTION_PROMPT, "--carry-initial-prompt"] if captions else ["--prompt", WHISPER_PROMPT]
     cmd = [WHISPER, "-m", MODEL, "-f", wav, "-l", "en", "-osrt",
-           "-of", out_base, "-ml", str(max_len), "-sow",
-           "-pp", "--prompt", WHISPER_PROMPT, *extra]
+           "-of", out_base, "-ml", str(max_len), "-sow", "-pp", *prompt, *extra]
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                          stderr=subprocess.PIPE, text=True)
     CHILDREN.append(p)
@@ -271,12 +294,181 @@ def transcribe(video, out_srt):
                total, P.set)
 
         P.stage("Listening and writing captions…", start + 0.04 * (1 - start), 0.97)
-        raw = whisper(wav, os.path.join(tmp, "whisper"), 42)
+        text = listen(wav, tmp, P.set)
 
         P.stage("Cleaning up…", 0.97, 1.0)
-        text = clean_srt(open(raw, encoding="utf-8").read())
+        text = clean_srt(text)
         write_atomic(out_srt, text)
         P.set(1.0)
+
+
+def listen(wav, tmp, on_frac):
+    """Captions for a 16 kHz WAV, before clean_srt: the words and timing from
+    one pass, anything it skipped heard again, and "He"/"His" for God from a
+    second pass with the house-style prompt."""
+    raw = whisper(wav, os.path.join(tmp, "words"), 42, on_frac=lambda f: on_frac(0.5 * f))
+    styled = whisper(wav, os.path.join(tmp, "style"), 42, on_frac=lambda f: on_frac(0.5 + 0.5 * f), captions=True)
+    text = relisten(wav, open(raw, encoding="utf-8").read())
+    return restyle(text, open(styled, encoding="utf-8").read())
+
+
+def restyle(text, styled):
+    """TEXT with he/him/his/himself capitalized wherever STYLED, the same
+    speech written with the house style, capitalizes them. The pronouns in
+    the two are lined up in order, one to one, by how many of the three words
+    either side agree (said within 5 seconds of each other, and the closer
+    the better), so a phrase said twice can't take the other's. Sentence
+    starts don't count."""
+    cues = parse_srt(text)
+    mine = [(ci, li, wi, w) for ci, (_, lines) in enumerate(cues) for li, line in enumerate(lines)
+            for wi, w in enumerate(line.split())]
+    when = [t for t, _, _ in spread_words(text)]
+    theirs = spread_words(styled)
+    m = [core(w[3]) for w in mine]
+    t = [core(w) for _, _, w in theirs]
+    pron = {"he", "him", "his", "himself"}
+    a = [i for i, c in enumerate(m) if c in pron]
+    b = [j for j, c in enumerate(t) if c in pron]
+
+    def score(i, j):
+        if m[i] != t[j] or abs(when[i] - theirs[j][0]) >= 5:
+            return None
+        same = sum(0 <= i + d < len(m) and 0 <= j + d < len(t) and m[i + d] == t[j + d]
+                   for d in (-3, -2, -1, 1, 2, 3))
+        return same + (5 - abs(when[i] - theirs[j][0])) / 5 if same else None
+
+    # Best in-order pairing (like lining up two sequences).
+    best = [[0.0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for x in range(len(a) - 1, -1, -1):
+        for y in range(len(b) - 1, -1, -1):
+            sc = score(a[x], b[y])
+            best[x][y] = max(best[x + 1][y], best[x][y + 1],
+                             sc + best[x + 1][y + 1] if sc is not None else 0.0)
+    x = y = 0
+    while x < len(a) and y < len(b):
+        sc = score(a[x], b[y])
+        if sc is not None and best[x][y] == sc + best[x + 1][y + 1]:
+            i, j = a[x], b[y]
+            w, sw = mine[i][3], theirs[j][2]
+            before = theirs[j - 1][2] if j else "."
+            starts = re.search(r"[.?!:][\"'\u201d\u2019)\]]*$", before) or before in ("\"", "\u201c")
+            if w[:1].islower() and sw[:1].isupper() and not starts:
+                ci, li, wi, _ = mine[i]
+                words = cues[ci][1][li].split()
+                words[wi] = w[0].upper() + w[1:]
+                cues[ci][1][li] = " ".join(words)
+            x, y = x + 1, y + 1
+        elif best[x][y] == best[x + 1][y]:
+            x += 1
+        else:
+            y += 1
+    return format_srt(cues)
+
+
+def relisten(wav, text):
+    """Whisper sometimes skips ahead inside its 30-second window and drops
+    what was said. One caption then stays up for 20 seconds with only a few
+    words in it; a whole scripture reading went missing that way. Listen to
+    each stretch like that again on its own, and use what it hears if it's
+    clearly more."""
+    cues = parse_srt(text)
+    times = [tuple(srt_seconds(x.strip()) for x in t.split("-->")) for t, _ in cues]
+    said = [" ".join(lines).split() for _, lines in cues]
+    sparse = [b - a >= 6 and len(w) < 1.2 * (b - a) for (a, b), w in zip(times, said)]
+    out = []
+    k = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        while k < len(cues):
+            if not sparse[k]:
+                out.append(cues[k])
+                k += 1
+                continue
+            first = k
+            while k + 1 < len(cues) and sparse[k + 1]:
+                k += 1
+            # From where the caption before ends (the dropped words can start
+            # in the gap) to a few seconds past the end, so the phrase it cuts
+            # into isn't lost. It listens from 5 seconds earlier still: started
+            # mid-sentence, Whisper can leave out all the punctuation.
+            a, b = times[first][0], times[k][1]
+            if first:
+                a = max(min(times[first - 1][1], a), a - 3)
+            early = max(a - 5, 0)
+            piece = os.path.join(tmp, f"again{k}.wav")
+            slice_wav(wav, early, b + 3, piece)
+            raw = whisper(piece, os.path.join(tmp, f"again{k}"), 42, ["-mc", "0"], on_frac=lambda f: None)
+            heard = [(early + x, early + y, w) for x, y, w in spread_words(open(raw, encoding="utf-8").read())]
+            heard = trim_overlap(heard, said[first - 1] if first else [], said[k + 1] if k + 1 < len(cues) else [], a, b)
+            if len(heard) < sum(len(w) for w in said[first:k + 1]) + 4:
+                out += cues[first:k + 1]
+            else:
+                # Between the captions either side, whatever Whisper's timing says.
+                lo = times[first - 1][1] if first else 0.0
+                hi = times[k + 1][0] if k + 1 < len(cues) else b + 3
+                out += regroup(heard, max(lo, 0.0), max(hi, b))
+            k += 1
+    return format_srt(out)
+
+
+def spread_words(text):
+    """[(start, end, word)] for every word in an SRT, each caption's time
+    shared out by the length of its words. (Asking Whisper for one word per
+    caption gets real word times, but sometimes no punctuation at all.)"""
+    out = []
+    for timing, lines in parse_srt(text):
+        a, b = (srt_seconds(x.strip()) for x in timing.split("-->"))
+        ws = " ".join(lines).split()
+        total = sum(len(w) + 1 for w in ws)
+        t = a
+        for w in ws:
+            d = (b - a) * (len(w) + 1) / total
+            out.append((t, t + d, w))
+            t += d
+    return out
+
+
+def trim_overlap(heard, before, after, a, b):
+    """Of words heard again from A to a little past B, the ones that belong
+    between the caption BEFORE and the caption AFTER. Their timing is only
+    roughly right, so the edges are found by the words the neighbours share
+    with it, and by time when they don't match up."""
+    said = [core(w) for _, _, w in heard]
+    # Where the next caption's first two words (or only word) come in, closest to B.
+    nxt = [core(w) for w in after[:2]]
+    cut = [j for j in range(len(heard) - len(nxt) + 1) if nxt and said[j:j + len(nxt)] == nxt
+           and abs(heard[j][0] - b) < 2.5]
+    end = min(cut, key=lambda j: abs(heard[j][0] - b)) if cut \
+        else next((j for j, h in enumerate(heard) if h[0] >= b - 0.05), len(heard))
+    # And where the last caption's final two words end (it heard them too),
+    # or by time.
+    prev = [core(w) for w in before[-2:]]
+    lead = [j + len(prev) for j in range(min(end, len(heard)) - len(prev) + 1) if prev
+            and said[j:j + len(prev)] == prev and abs(heard[j][0] - a) < 3]
+    start = min(lead, key=lambda j: abs(heard[j - 1][1] - a)) if lead \
+        else next((j for j, h in enumerate(heard) if h[0] >= a - 0.05), end)
+    return heard[start:end]
+
+
+def regroup(heard, lo, hi):
+    """Words back into captions of up to 42 characters, as in the first pass,
+    timed in order between LO and HI (the captions either side)."""
+    groups = [[heard[0]]]
+    for h in heard[1:]:
+        if len(" ".join(w for _, _, w in groups[-1] + [h])) > 42:
+            groups.append([])
+        groups[-1].append(h)
+    # Each starts no earlier than LO or the one before, and leaves the rest
+    # at least 0.3 s each before HI.
+    starts, t = [], lo
+    for n, g in enumerate(groups):
+        t = min(max(g[0][0], t), hi - 0.3 * (len(groups) - n))
+        starts.append(max(t, lo))
+        t = starts[-1] + 0.3
+    out = []
+    for n, g in enumerate(groups):
+        end = starts[n + 1] if n + 1 < len(groups) else min(max(g[-1][1], starts[n] + 0.3), hi)
+        out.append([f"{srt_time(starts[n])} --> {srt_time(max(end, starts[n]))}", [" ".join(w for _, _, w in g)]])
+    return out
 
 
 def captions_text(video, start, length, on_frac):
@@ -286,8 +478,7 @@ def captions_text(video, start, length, on_frac):
         wav = os.path.join(tmp, "audio.wav")
         ffmpeg(["-ss", f"{start:.4f}", "-i", video, "-t", f"{length:.4f}", "-map", "0:a:0",
                 "-ar", "16000", "-ac", "1", wav], length, lambda f: on_frac(0.05 * f))
-        raw = whisper(wav, os.path.join(tmp, "whisper"), 42, on_frac=lambda f: on_frac(0.05 + 0.95 * f))
-        return clean_srt(open(raw, encoding="utf-8").read())
+        return clean_srt(listen(wav, tmp, lambda f: on_frac(0.05 + 0.95 * f)))
 
 
 def parse_srt(text):
@@ -328,6 +519,55 @@ def strip_fillers(line):
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
+def verse_ref(ws, i):
+    """If a Bible reference starts at word I ("Galatians chapter 2, verse 20.",
+    "2 Peter 1, 20-21", "Proverbs 4.23", "2 Timothy 3, 14 through 17"),
+    return it written as "Galatians 2:20." and how many words it took."""
+    j, book = i, []
+    if core(ws[j]) in ORDINALS and j + 1 < len(ws) and core(ws[j + 1]) in BOOKS and ws[j][-1].isalnum():
+        book.append(ORDINALS[core(ws[j])])
+        j += 1
+    if j >= len(ws) or core(ws[j]) not in BOOKS or not ws[j][:1].isupper() or not ws[j][-1].isalpha():
+        return None
+    book.append(ws[j])
+    j += 1
+    if j < len(ws) and ws[j].lower() == "chapter":
+        j += 1
+    if j >= len(ws):
+        return None
+    joined = re.fullmatch(r"(\d+)[.:](\d+)(?:[-–](\d+))?(\W*)", ws[j])
+    if joined:
+        ch, v, to, tail = joined.groups()
+        j += 1
+    else:
+        m = re.fullmatch(r"(\d+)(,?)", ws[j])
+        if not m or j + 1 >= len(ws):
+            return None
+        ch = m.group(1)
+        j += 1
+        verse_word = ws[j].lower() in ("verse", "verses")
+        if not m.group(2) and not verse_word:
+            return None   # "John 3 16" could be anything
+        j += verse_word
+        m = j < len(ws) and re.fullmatch(r"(\d+)(?:[-–](\d+))?(\W*)", ws[j])
+        if not m:
+            return None
+        v, to, tail = m.groups()
+        j += 1
+        # "Mark 1, 2, and 3 on your outline" is a list, not a verse. (After a
+        # name that's also a plain word, "Mark 1, 2 and 3" is too.)
+        more = j + 1 < len(ws) and ws[j].lower() in ("and", "or") and re.fullmatch(r"\d+\W*", ws[j + 1])
+        if j < len(ws) and ((tail == "," and (re.fullmatch(r"\d+\W*", ws[j]) or more))
+                            or (more and core(book[-1]) in ("mark", "job", "acts", "numbers"))):
+            return None
+        if not to and not tail and j + 1 < len(ws) and ws[j].lower() in ("through", "to"):
+            m = re.fullmatch(r"(\d+)(\W*)", ws[j + 1])
+            if m:
+                to, tail = m.groups()
+                j += 2
+    return " ".join(book) + f" {ch}:{v}" + (f"-{to}" if to else "") + tail, j - i
+
+
 def clean_srt(text):
     cues = parse_srt(text)
     # Fillers and house spellings, per line.
@@ -341,10 +581,28 @@ def clean_srt(text):
                 lines.append(new)
         cue[1] = lines
 
-    # Stuttered repeats, across cue boundaries too.
+    # Joins and stuttered repeats, across cue boundaries too.
     words = [[ci, li, wi, w] for ci, cue in enumerate(cues)
              for li, line in enumerate(cue[1])
              for wi, w in enumerate(line.split())]
+    # Bible references as "John 3:16", and "High" / "Ridge" split across lines.
+    ws, joined, k = [w[3] for w in words], [], 0
+    absorbed = set()   # captions whose words moved into a later one
+    while k < len(words):
+        ref = verse_ref(ws, k)
+        n = ref[1] if ref else 2 if ws[k] == "High" and k + 1 < len(words) \
+            and re.fullmatch(r"Ridge\W*", ws[k + 1]) else 1
+        if n > 1:
+            # It goes where its last part was said, so it's on screen then;
+            # captions it empties hand their time to the next one.
+            host = words[k + n - 1]
+            host[3] = ref[0] if ref else "HighRidge" + ws[k + 1][5:]
+            absorbed |= {w[0] for w in words[k:k + n - 1]} - {host[0]}
+            joined.append(host)
+        else:
+            joined.append(words[k])
+        k += n
+    words = joined
     drop = set()
     for k in range(1, len(words)):
         a, b = words[k - 1][3], words[k][3]
@@ -359,9 +617,19 @@ def clean_srt(text):
     for k, (ci, li, wi, w) in enumerate(words):
         if k not in drop:
             rebuilt[ci][li].append(w)
-    for cue, lines in zip(cues, rebuilt):
+    kept, early = [], None
+    for ci, (cue, lines) in enumerate(zip(cues, rebuilt)):
         cue[1] = [" ".join(ws) for ws in lines if ws]
-    return format_srt([c for c in cues if c[1]])
+        if cue[1]:
+            if early:
+                cue[0] = early + " --> " + cue[0].split("-->")[1].strip()
+                early = None
+            kept.append(cue)
+        elif ci in absorbed and early is None:
+            # Its words went into a later caption (a reference said across
+            # captions), which starts this one's time instead.
+            early = cue[0].split("-->")[0].strip()
+    return format_srt(kept)
 
 
 def write_atomic(path, text):
