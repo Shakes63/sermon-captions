@@ -641,7 +641,36 @@ def clean_srt(text):
             # Its words went into a later caption (a reference said across
             # captions), which starts this one's time instead.
             early = cue[0].split("-->")[0].strip()
-    return format_srt(kept)
+    return format_srt(screen_time(kept))
+
+
+def screen_time(cues):
+    """Every caption on screen for a real stretch, in order. Whisper now and
+    then writes one that starts and ends at the same moment (HeyGen rejects
+    the whole file: "end time is before start time") or that starts before
+    the one before it ends. Such a caption gets time from the gap before or
+    after it (about 60 ms a character, at least 0.3 s); with no room either
+    side, its words join the caption before."""
+    times = [[srt_seconds(x.strip()) for x in t.split("-->")] for t, _ in cues]
+    out = []   # [start, end, lines]
+    for k, ((a, b), (_, lines)) in enumerate(zip(times, cues)):
+        prev = out[-1][1] if out else 0.0
+        a = max(a, prev)
+        if b - a >= 0.05:
+            out.append([a, b, lines])
+            continue
+        need = max(0.3, 0.06 * len(" ".join(lines)))
+        nxt = times[k + 1][0] if k + 1 < len(cues) else b + need
+        if b - max(prev, b - need) >= 0.3 - 1e-6:   # (tolerance for float rounding)
+            out.append([max(prev, b - need), b, lines])
+        elif min(nxt, a + need) - a >= 0.3 - 1e-6:
+            out.append([a, min(nxt, a + need), lines])
+        elif out:
+            out[-1][1] = max(out[-1][1], b)
+            out[-1][2] = out[-1][2] + lines
+        else:
+            out.append([a, a + need, lines])
+    return [[f"{srt_time(a)} --> {srt_time(b)}", lines] for a, b, lines in out]
 
 
 def write_atomic(path, text):
@@ -811,7 +840,7 @@ def spanish(orig, copy, en_srt, out_srt, out_mp4):
 
         P.stage("Lining up the Spanish video with the original…", 0.18, 0.24)
         t_orig, t_copy = time_map(og, cg)
-        write_atomic(out_srt, retime(src_srt, t_orig, t_copy))
+        write_atomic(out_srt, format_srt(screen_time(parse_srt(retime(src_srt, t_orig, t_copy)))))
         P.set(1.0)
 
         P.stage("Adding captions to the Spanish video…", 0.24, 1.0)
