@@ -1043,7 +1043,109 @@ def parse_music(music):
     return music
 
 
-def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None, repair=None):
+LOUDNESS_TARGET = -16.0  # what "Even out the volume" aims for (the trim window's targetLoudness)
+LIMITER = "alimiter=limit=0.8414:attack=5:release=50:level=disabled:latency=1"
+
+
+BT709 = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+
+
+def picture(video):
+    """Width and height as shown (after any rotation) and the frame rate
+    ffmpeg will give VIDEO's picture."""
+    def rate_of(text):
+        a, _, b = text.partition("/")
+        try:
+            return float(a) / float(b or 1)
+        except (ValueError, ZeroDivisionError):
+            return 0.0
+
+    def run(cmd):
+        return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+    out = run([FFPROBE, "-v", "error", "-select_streams", "V:0", "-show_entries",
+               "stream=width,height,r_frame_rate,avg_frame_rate:stream_side_data=rotation",
+               "-of", "default=nw=1", video])
+    info = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    try:
+        w, h = int(info["width"]), int(info["height"])
+    except (KeyError, ValueError):
+        fail(f"Couldn't read the picture size of {os.path.basename(video)}.")
+    if abs(rate_of(info.get("rotation", "0") + "/1")) % 180 == 90:
+        w, h = h, w
+    # As ffmpeg picks it: the stream's own rate, unless that's implausible.
+    rate = info.get("r_frame_rate", "")
+    if not 0 < rate_of(rate) <= 210:
+        rate = info.get("avg_frame_rate", "")
+    if not 0 < rate_of(rate) <= 210:
+        rate = "30"
+    return w, h, rate
+
+
+def picture_length(video):
+    """When VIDEO's picture ends, counted from the start of the file (the
+    sound can start earlier or run a little longer)."""
+    try:
+        start, length = (probe(video, "stream=start_time,duration", "V:0").split("\n") + [""])[:2]
+        first = probe(video, "format=start_time")
+        return float(length) + max(float(start) - float(first), 0)
+    except ValueError:
+        return duration(video)
+
+
+def has_sound(video):
+    return probe(video, "stream=index", "a:0") != ""
+
+
+def loudness(video):
+    """Integrated loudness of VIDEO's sound in LUFS, as it goes into the
+    saved video (stereo), or None if it's silent."""
+    r = subprocess.run([FFMPEG, "-nostdin", "-hide_banner", "-i", video, "-map", "0:a:0",
+                        "-af", stereo(video) + ",ebur128=framelog=quiet", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    found = re.findall(r"I:\s+(-?[\d.]+) LUFS", r.stderr)
+    return float(found[-1]) if found and float(found[-1]) > -60 else None
+
+
+def add_clip(path, k, label, size, level, target=LOUDNESS_TARGET):
+    """Filters for an intro or outro (ffmpeg input K) made to match the
+    sermon: same picture size and frame rate, letterboxed if the shape
+    differs, 48 kHz stereo sound (silence if it has none), and brought to
+    the same loudness when the sermon's volume is evened out. Ends in
+    [LABELv] and [LABELa]; returns the filters and the clip's length."""
+    w, h, rate = size
+    length = picture_length(path)
+    # Untagged clips are taken the way players take them (HD as bt709);
+    # tagged ones go by their tags.
+    matrix = "auto"
+    if probe(path, "stream=color_space", "V:0") in ("", "unknown", "reserved"):
+        tall = probe(path, "stream=height", "V:0")
+        matrix = "bt709" if tall.isdigit() and int(tall) >= 720 else "bt601"
+    # Square pixels first, so a clip with non-square ones keeps its shape.
+    # Picture and sound keep their places relative to each other: whichever
+    # starts late is padded at the front (first frame held, or silence).
+    graph = (f"[{k}:V:0]scale=trunc(iw*sar/2)*2:ih,setsar=1,"
+             f"scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+             f":in_color_matrix={matrix}:out_color_matrix=bt709:out_range=tv,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+             f"fps={rate}:start_time=0,format=yuv420p,{BT709},trim=duration={length:.6f}[{label}v];")
+    if has_sound(path):
+        gain = ""
+        lufs = loudness(path) if level else None
+        if lufs is not None:
+            gain = f",volume={min(max(target - lufs, -12), 18):.2f}dB,{LIMITER}"
+        graph += (f"[{k}:a:0]aresample=async=1:first_pts=0,{stereo(path)}{gain},apad,"
+                  f"atrim=duration={length:.6f}[{label}a];")
+    else:
+        graph += f"anullsrc=r={RATE}:cl=stereo,aformat=sample_fmts=flt,atrim=duration={length:.6f}[{label}a];"
+    return graph, length
+
+
+# What Whisper writes for music or silence instead of words.
+NOT_SPEECH = re.compile(r"\s*(\[[^\]]*\]|\([^)]*\)|[♪♫\s*]+)\s*")
+
+
+def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None, repair=None,
+         intro=None, outro=None):
     for tool in (FFMPEG, FFPROBE) + ((WHISPER,) if captions else ()):
         if not os.path.exists(tool):
             fail(f"Missing {tool}")
@@ -1055,6 +1157,9 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
         fail("The end point has to be after the start point.")
     if look != "-" and not os.path.exists(look):
         fail("The Auto color table is missing. Turn Auto color off and on again.")
+    for which, path in (("intro", intro), ("outro", outro)):
+        if path and not os.path.exists(path):
+            fail(f"The {which} video ({os.path.basename(path)}) is missing. Choose it again in the trim editor.")
     vf, af = [], []
     if look != "-":
         # The table holds the video's own R'G'B' values (bt709), in 16 bits
@@ -1065,12 +1170,16 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
     if level != "-":
         # One fixed change (what the trim window previews), then a limiter
         # 1.5 dB under full scale for peaks the boost pushes too far.
-        af += [f"volume={float(level):.2f}dB",
-               "alimiter=limit=0.8414:attack=5:release=50:level=disabled:latency=1"]
+        af += [f"volume={float(level):.2f}dB", LIMITER]
+    # An intro or outro cuts straight to the sermon, so that end doesn't fade.
     if fade == "1" and length > 2 * FADE_SECONDS:
         end = length - FADE_SECONDS
-        vf += [f"fade=t=in:st=0:d={FADE_SECONDS}", f"fade=t=out:st={end:.3f}:d={FADE_SECONDS}"]
-        af += [f"afade=t=in:st=0:d={FADE_SECONDS}", f"afade=t=out:st={end:.3f}:d={FADE_SECONDS}"]
+        if not intro:
+            vf.append(f"fade=t=in:st=0:d={FADE_SECONDS}")
+            af.append(f"afade=t=in:st=0:d={FADE_SECONDS}")
+        if not outro:
+            vf.append(f"fade=t=out:st={end:.3f}:d={FADE_SECONDS}")
+            af.append(f"afade=t=out:st={end:.3f}:d={FADE_SECONDS}")
     base = ensure_model() if captions else 0.0
     P.stage("Saving the trimmed video and writing its captions…" if captions else "Saving the trimmed video…",
             base, 1.0)
@@ -1078,25 +1187,62 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
     # -ss before -i plus a re-encode cuts on the exact frame, not the
     # nearest keyframe. -a53cc 0 everywhere: Subsplash downloads carry TV
     # closed captions, and the hardware encoder fails trying to keep them.
-    args = ["-ss", f"{start:.4f}", "-i", video]
+    args = ["-ss", f"{start:.4f}", "-t", f"{length:.4f}", "-i", video]
+    after = "".join("," + f for f in af)
+    sermon_sound = has_sound(video)
+    # The sermon's sound ends in [sa] and its picture in [sv].
     if repair:
         # The repaired voice (music choices already in it) replaces the sound.
         path, from_ = repair
+        args += ["-i", path]
         graph = (f"[1:a]atrim=start={start - float(from_):.6f}:duration={length:.6f},asetpts=PTS-STARTPTS,"
                  f"aresample={RATE},aformat=sample_fmts=flt:channel_layouts=mono,pan=stereo|c0=c0|c1=c0"
-                 + "".join("," + f for f in af) + "[a]")
-        args += ["-i", path, "-t", f"{length:.4f}", "-filter_complex", graph, "-map", "0:V:0", "-map", "[a]"]
+                 + after + "[sa];")
     elif music:
         inputs, graph = mixed_sound(video, music, 1)
-        graph += (f"[mix]atrim=start={start:.6f}:duration={length:.6f},asetpts=PTS-STARTPTS"
-                  + "".join("," + f for f in af) + "[a]")
-        args += inputs + ["-t", f"{length:.4f}", "-filter_complex", graph, "-map", "0:V:0", "-map", "[a]"]
+        args += inputs
+        graph += f"[mix]atrim=start={start:.6f}:duration={length:.6f},asetpts=PTS-STARTPTS" + after + "[sa];"
+    elif sermon_sound:
+        graph = "[0:a:0]" + (",".join(af) or "anull") + (f",{stereo(video)}" if intro or outro else "") + "[sa];"
+    elif intro or outro:
+        graph = f"anullsrc=r={RATE}:cl=stereo,aformat=sample_fmts=flt,atrim=duration={length:.6f}[sa];"
     else:
-        args += ["-t", f"{length:.4f}", "-map", "0:V:0", "-map", "0:a:0?"]
-        if af:
-            args += ["-af", ",".join(af)]
-    if vf:
-        args += ["-vf", ",".join(vf)]
+        graph = ""   # no sound in, none out
+    graph += "[0:V:0]" + (",".join(vf) or "null") + "[sv]"
+    # What the captions are made from: (video, from, length, where it lands, name).
+    pieces = [(video, start, length, 0.0, "sermon")]
+    total = length
+    if not (intro or outro):
+        maps = ["-map", "[sv]"] + (["-map", "[sa]"] if "[sa]" in graph else [])
+    else:
+        # Joined with a straight cut: the clips are made to match the
+        # sermon's picture and sound, then all of it goes through concat.
+        size = picture(video)
+        # The app evens out a mono sermon measured as mono; doubled onto both
+        # sides here it plays 3 dB louder, so the clips go 3 dB louder too.
+        target = LOUDNESS_TARGET
+        if not repair and sermon_sound and probe(video, "stream=channels", "a:0").split("\n")[0] == "1":
+            target += 3
+        graph += (f";[sv]setsar=1,fps={size[2]}:start_time=0,format=yuv420p,{BT709}[mv];"
+                  f"[sa]aresample={RATE}:async=1:first_pts=0,aformat=sample_fmts=flt:channel_layouts=stereo[ma];")
+        parts, pieces, total = [], [], 0.0
+        for label, path in (("intro", intro), ("m", None), ("outro", outro)):
+            if label == "m":
+                parts.append("[mv][ma]")
+                if sermon_sound:   # a silent sermon has nothing to caption
+                    pieces.append((video, start, length, total, "sermon"))
+                total += length
+            elif path:
+                filters, clip = add_clip(path, args.count("-i"), label, size, level != "-", target)
+                args += ["-i", path]
+                graph += filters
+                parts.append(f"[{label}v][{label}a]")
+                if captions and has_sound(path) and loudness(path) is not None:   # a silent track has nothing to caption
+                    pieces.append((path, 0.0, clip, total, label))
+                total += clip
+        graph += "".join(parts) + f"concat=n={len(parts)}:v=1:a=1[v][a]"
+        maps = ["-map", "[v]", "-map", "[a]"]
+    args += ["-filter_complex", graph] + maps
     args += ["-c:v", "h264_videotoolbox", "-a53cc", "0", "-b:v", str(video_bitrate(video)), "-profile:v", "high",
              "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
              "-movflags", "+faststart", "-y", partial]
@@ -1105,13 +1251,38 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
     # encoder, so together they take about as long as the save alone.
     frac = {"video": 0.0, "captions": 0.0}
     text, problem = [], []
+    missed = []   # (intro or outro, why) for a clip whose captions failed
 
     def show():
         P.set(0.65 * frac["video"] + 0.35 * frac["captions"] if captions else frac["video"])
 
     def make_captions():
         try:
-            text.append(captions_text(video, start, length, lambda f: frac.__setitem__("captions", f)))
+            # The sermon, plus anything said in the intro or outro, each
+            # moved to where it lands in the saved video.
+            cues, done = [], 0.0
+            whole = sum(piece[2] for piece in pieces)
+            for path, at, span, lands, name in pieces:
+                try:
+                    part = captions_text(path, at, span,
+                                         lambda f: frac.__setitem__("captions", (done + f * span) / whole))
+                    # None runs past its own piece into the next.
+                    for cue in parse_srt(part):
+                        t0, t1 = (srt_seconds(x.strip()) for x in cue[0].split("-->"))
+                        if t0 >= span - 0.05 or all(NOT_SPEECH.fullmatch(line) for line in cue[1]):
+                            continue
+                        cues.append([f"{srt_time(t0 + lands)} --> {srt_time(min(t1, span) + lands)}", cue[1]])
+                except Exception as e:
+                    if name == "sermon":
+                        raise
+                    # A failed intro or outro doesn't stop the sermon's captions, but it's reported.
+                    why = str(e) if isinstance(e, Fail) else f"{type(e).__name__}: {e}"
+                    missed.append((name, " ".join(why.split())))   # one line: the app reads messages by line
+                done += span
+            if cues:
+                text.append(format_srt(screen_time(cues)))
+            else:
+                problem.append(missed[0][1] if missed else "there's no speech in it")
         except Fail as e:
             problem.append(str(e))
         except Exception as e:
@@ -1124,7 +1295,7 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
         with tempfile.TemporaryDirectory() as tmp:
             if look != "-":
                 shutil.copy(look, os.path.join(tmp, "look.cube"))
-            ffmpeg(args, length, lambda f: (frac.__setitem__("video", f), show()), cwd=tmp)
+            ffmpeg(args, total, lambda f: (frac.__setitem__("video", f), show()), cwd=tmp)
         if worker and worker.is_alive():
             emit("STAGE", "Finishing the captions…")
             while worker.is_alive():
@@ -1139,6 +1310,10 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
     if captions:
         if text:
             write_atomic(captions, text[0])
+            if missed:
+                emit("WARN", "The trimmed video and captions are saved, but the captions for the "
+                     + " and ".join(name for name, _ in missed) + " couldn't be made (" + missed[0][1][:200]
+                     + "). Click Make English captions in step 2 to try again.")
         else:
             emit("WARN", "The trimmed video is saved, but its captions couldn't be made ("
                  + (problem[0] if problem else "unknown error")[:200]
@@ -1987,16 +2162,20 @@ def separate_one(video, fmt, model, start, end, out_wav, lo, hi, which):
 
 def main():
     args = sys.argv[2:]
-    captions = repaired = None
-    while sys.argv[1:2] == ["trim"] and args[:1] in (["--captions"], ["--repair"]):
+    captions = repaired = intro = outro = None
+    while sys.argv[1:2] == ["trim"] and args[:1] in (["--captions"], ["--repair"], ["--intro"], ["--outro"]):
         if args[0] == "--captions" and len(args) > 1:
             captions, args = args[1], args[2:]
+        elif args[0] == "--intro" and len(args) > 1:
+            intro, args = args[1], args[2:]
+        elif args[0] == "--outro" and len(args) > 1:
+            outro, args = args[1], args[2:]
         elif args[0] == "--repair" and len(args) > 2:
             repaired, args = (args[1], args[2]), args[3:]
         else:
             break
     if sys.argv[1:2] == ["trim"] and len(args) >= 7 and (len(args) - 7) % 3 == 0:
-        trim(*args, captions=captions, repair=repaired)
+        trim(*args, captions=captions, repair=repaired, intro=intro, outro=outro)
     elif len(sys.argv) >= 6 and (len(sys.argv) - 6) % 3 == 0 and sys.argv[1] == "repair":
         repair(*sys.argv[2:])
     elif len(sys.argv) >= 6 and (len(sys.argv) - 3) % 3 == 0 and sys.argv[1] == "separate":
@@ -2010,7 +2189,7 @@ def main():
     elif len(sys.argv) >= 3 and sys.argv[1] == "send":
         send(*sys.argv[2:])
     else:
-        fail("usage: trim [--captions OUT.srt] [--repair VOICE.wav FROM] VIDEO OUT.mp4 START LENGTH FADE LEVEL LOOK.cube "
+        fail("usage: trim [--captions OUT.srt] [--repair VOICE.wav FROM] [--intro CLIP] [--outro CLIP] VIDEO OUT.mp4 START LENGTH FADE LEVEL LOOK.cube "
              "[MUSIC.wav AT AMOUNT]... | "
              "repair VIDEO START LENGTH OUT.wav [MUSIC.wav AT AMOUNT]... | "
              "separate VIDEO FROM TO OUT.wav [FROM TO OUT.wav]... | suggest VIDEO OUT.json | "

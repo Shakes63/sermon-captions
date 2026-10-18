@@ -251,7 +251,7 @@ final class Model: ObservableObject {
         }
         let c = TrimController(url: src, saved: saved)
         c.onChange = { [weak self, weak c] in
-            guard let self, let c, c.ready, let p = self.trimPointsPath else { return }
+            guard let self, let c, c.ready, self.trim === c, let p = self.trimPointsPath else { return }
             try? FileManager.default.createDirectory(at: p.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? JSONEncoder().encode(c.points).write(to: p)
         }
@@ -286,7 +286,7 @@ final class Model: ObservableObject {
             let srt = out.deletingLastPathComponent()
                 .appendingPathComponent("\(baseName(out)) - English captions (English timing).srt")
             trimMadeCaptions = Self.captionsWithTrim
-            run(.trim, ["trim"] + (trimMadeCaptions ? ["--captions", srt.path] : []) + c.repairArgs
+            run(.trim, ["trim"] + (trimMadeCaptions ? ["--captions", srt.path] : []) + c.repairArgs + c.clipArgs
                     + [src.path, out.path, String(format: "%.6f", c.exportStart),
                        String(format: "%.6f", c.exportLength), c.fade ? "1" : "0", c.levelArg,
                        c.colorArg] + c.musicArgs,
@@ -868,7 +868,7 @@ struct SermonCaptionsApp: App {
         // `--snapshot out.png [english] [spanish]` renders the window to a PNG and exits.
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--snapshot-trim"), i + 2 < args.count {
-            Snapshot.renderTrim(to: args[i + 1], video: args[i + 2])
+            Snapshot.renderTrim(to: args[i + 1], video: args[i + 2], intro: args.dropFirst(i + 3).first)
             exit(0)
         }
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
@@ -893,7 +893,7 @@ struct SermonCaptionsApp: App {
 
 @MainActor
 enum Snapshot {
-    static func renderTrim(to path: String, video: String) {
+    static func renderTrim(to path: String, video: String, intro: String? = nil) {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         let model = Model()
@@ -920,6 +920,7 @@ enum Snapshot {
         c.addSection()
         c.seek(2139)
         if let id = c.sections.last?.id { c.setSectionEnd(id) }
+        if let intro { Task { _ = await c.chooseClip(.intro, URL(fileURLWithPath: intro), remember: false) } }
         c.seek(84)
         RunLoop.current.run(until: Date().addingTimeInterval(1))
         let host = NSHostingView(rootView: TrimEditor(model: model, c: c)

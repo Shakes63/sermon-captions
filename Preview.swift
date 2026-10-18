@@ -11,6 +11,9 @@ import os
 /// What the saved video will do, in the source video's time.
 struct PreviewSettings {
     var fade = false
+    /// Off at an end that cuts straight to an intro or outro.
+    var fadeIn = true
+    var fadeOut = true
     /// The saved video runs from `start` to `end` (seconds in the source).
     var start = 0.0
     var end = 0.0
@@ -30,7 +33,9 @@ struct PreviewSettings {
     /// changes (that part isn't in the video at all).
     func fadeLevel(_ t: Double) -> Double {
         guard fade, t >= start, t <= end, end - start > 2 * Self.fadeSeconds else { return 1 }
-        return min(min((t - start) / Self.fadeSeconds, (end - t) / Self.fadeSeconds), 1)
+        let up = fadeIn ? (t - start) / Self.fadeSeconds : 1
+        let down = fadeOut ? (end - t) / Self.fadeSeconds : 1
+        return min(up, down, 1)
     }
 
     func inside(_ t: Double) -> Bool { t >= start && t <= end }

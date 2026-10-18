@@ -1,6 +1,7 @@
 // The trim window: a player plus two timelines (the whole video, and a
 // zoomed-in strip around the playhead) for picking the start and end frame,
-// and sections where music behind the speaking can be turned down.
+// sections where music behind the speaking can be turned down, and an intro
+// and outro to put before and after it.
 
 import AVFoundation
 import AVKit
@@ -8,6 +9,7 @@ import Accelerate
 import AppKit
 import CryptoKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct TrimPoints: Codable {
     var inTime: Double
@@ -17,6 +19,8 @@ struct TrimPoints: Codable {
     var musicSections: [MusicSection]?
     var autoColor: Bool?
     var repair: Bool?
+    var intro: String?
+    var outro: String?
     // A single section, as saved by the first version with music.
     var musicFrom: Double?
     var musicTo: Double?
@@ -68,6 +72,19 @@ enum MusicChoice: String, Codable, CaseIterable, Identifiable {
         case .removed: 1
         }
     }
+}
+
+/// A video saved as it is before (intro) or after (outro) the part being kept.
+struct Clip: Equatable {
+    let url: URL
+    let duration: Double
+}
+
+enum ClipSlot {
+    case intro, outro
+    var name: String { self == .intro ? "intro" : "outro" }
+    /// The last one chosen, which a new sermon starts with.
+    var defaultsKey: String { self == .intro ? "lastIntro" : "lastOutro" }
 }
 
 /// Owns the player and the start/end points. Times are always snapped to the
@@ -154,6 +171,10 @@ final class TrimController: ObservableObject {
     /// Which of the suggested starts and ends is showing.
     @Published var startPick = 0
     @Published var endPick = 0
+    @Published private(set) var intro: Clip?
+    @Published private(set) var outro: Clip?
+    /// Set when a saved intro or outro can't be found any more.
+    @Published private(set) var clipNote: String?
     var onChange: (() -> Void)?
 
     private var observer: Any?
@@ -179,6 +200,8 @@ final class TrimController: ObservableObject {
     /// The section "play section" is playing, so 1 2 3 change it even during
     /// the run-up, when the playhead may still be in the one before.
     private var playingSection: UUID?
+    /// Set once the window has moved on to another video.
+    private var closed = false
 
     init(url: URL, saved: TrimPoints?) {
         self.url = url
@@ -193,6 +216,7 @@ final class TrimController: ObservableObject {
     }
 
     func shutdown() {
+        closed = true
         player.pause()
         if let observer { player.removeTimeObserver(observer) }
         observer = nil
@@ -215,6 +239,8 @@ final class TrimController: ObservableObject {
     func snap(_ t: Double) -> Double { time(min(max(frame(t), 0), lastFrame)) }
     var keptFrames: Int { frame(outPoint) - frame(inPoint) + 1 }
     var keptSeconds: Double { Double(keptFrames) / fps }
+    /// The saved video's length, with the intro and outro.
+    var savedSeconds: Double { keptSeconds + (intro?.duration ?? 0) + (outro?.duration ?? 0) }
 
     // MARK: loading
 
@@ -234,7 +260,9 @@ final class TrimController: ObservableObject {
         if let rate = try? await track.load(.nominalFrameRate), rate > 0 {
             fps = Double(rate)
         }
+        var clips: [(ClipSlot, String?)] = [(.intro, nil), (.outro, nil)]
         if let saved, saved.outTime > saved.inTime, saved.outTime <= d {
+            clips = [(.intro, saved.intro), (.outro, saved.outro)]
             inPoint = snap(saved.inTime)
             outPoint = snap(saved.outTime)
             fade = saved.fade
@@ -257,7 +285,20 @@ final class TrimController: ObservableObject {
             fade = true
             level = true
             autoColor = true
+            // And with the intro and outro the last sermon had.
+            clips = [ClipSlot.intro, .outro].map { ($0, UserDefaults.standard.string(forKey: $0.defaultsKey)) }
         }
+        var lost: [String] = []
+        for (slot, path) in clips {
+            guard let path else { continue }
+            let url = URL(fileURLWithPath: path)
+            if let d = await Self.clipLength(url) {
+                setClip(slot, Clip(url: url, duration: d))
+            } else {
+                lost.append("The \(slot.name) (\(url.lastPathComponent)) can't be found, so it's been left off.")
+            }
+        }
+        clipNote = lost.isEmpty ? nil : lost.joined(separator: " ")
         assetSoundTrack = try? await asset.loadTracks(withMediaType: .audio).first?.trackID
         soundTrack = assetSoundTrack
         ready = true
@@ -628,12 +669,13 @@ final class TrimController: ObservableObject {
     var suggestedEnd: TrimSuggestion? { suggestions?.ends[safe: endPick] }
 
     /// With the fade on, the suggested cut leaves the fade room in the pause
-    /// (as Jacob cuts it); with it off, half a second from his voice at most.
+    /// (as Jacob cuts it); with it off, or where an intro or outro takes its
+    /// place, half a second from his voice at most.
     func startTime(_ s: TrimSuggestion) -> Double {
-        fade ? s.time : max(s.time, s.word - min(0.5, (s.word - s.room) * 0.6))
+        fade && intro == nil ? s.time : max(s.time, s.word - min(0.5, (s.word - s.room) * 0.6))
     }
     func endTime(_ s: TrimSuggestion) -> Double {
-        fade ? s.time : min(s.time, s.word + min(0.5, (s.room - s.word) * 0.6))
+        fade && outro == nil ? s.time : min(s.time, s.word + min(0.5, (s.room - s.word) * 0.6))
     }
 
     func useStart(_ s: TrimSuggestion) {
@@ -769,9 +811,11 @@ final class TrimController: ObservableObject {
     private func updatePreview() {
         let start = exportStart, end = exportStart + exportLength
         let gain = level ? Float(pow(10, (loudness?.gainDB ?? 0) / 20)) : 1
-        let fade = fade
+        let fade = fade, fadeIn = intro == nil, fadeOut = outro == nil
         preview.update {
             $0.fade = fade
+            $0.fadeIn = fadeIn
+            $0.fadeOut = fadeOut
             $0.start = start
             $0.end = end
             $0.gain = gain
@@ -831,6 +875,53 @@ final class TrimController: ObservableObject {
 
     /// The .cube file for `sermon_captions.py trim`, or "-" for none.
     var colorArg: String { autoColor ? (color?.file.path ?? "-") : "-" }
+
+    // MARK: intro and outro
+
+    /// Use (or with nil, take off) an intro or outro the user picked.
+    /// Returns why not, if the file can't be used.
+    func chooseClip(_ slot: ClipSlot, _ url: URL?, remember: Bool = true) async -> String? {
+        guard ready else { return nil }
+        clipPicks[slot, default: 0] += 1
+        let pick = clipPicks[slot]
+        var clip: Clip?
+        if let url {
+            let d = await Self.clipLength(url)
+            guard clipPicks[slot] == pick, !closed else { return nil }   // a later pick (or video) took its place
+            guard let d else { return "Couldn't read the video in \(url.lastPathComponent)." }
+            clip = Clip(url: url, duration: d)
+        }
+        setClip(slot, clip)
+        clipNote = nil
+        if remember { UserDefaults.standard.set(url?.path, forKey: slot.defaultsKey) }
+        onChange?()
+        return nil
+    }
+
+    /// Counts each slot's picks, so a slow one can't land after a newer one.
+    private var clipPicks: [ClipSlot: Int] = [:]
+
+    private func setClip(_ slot: ClipSlot, _ clip: Clip?) {
+        switch slot {
+        case .intro: intro = clip
+        case .outro: outro = clip
+        }
+        updatePreview()   // that end of the sermon stops (or starts) fading
+    }
+
+    /// How long a video's picture runs, or nil if it has none.
+    nonisolated static func clipLength(_ url: URL) async -> Double? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let range = try? await track.load(.timeRange) else { return nil }
+        let d = range.end.seconds
+        return d.isFinite && d > 0 ? d : nil
+    }
+
+    /// Extra arguments for `sermon_captions.py trim`.
+    var clipArgs: [String] {
+        (intro.map { ["--intro", $0.url.path] } ?? []) + (outro.map { ["--outro", $0.url.path] } ?? [])
+    }
 
     // MARK: repair
 
@@ -1226,7 +1317,7 @@ final class TrimController: ObservableObject {
 
     var points: TrimPoints {
         TrimPoints(inTime: inPoint, outTime: outPoint, fade: fade, level: level, musicSections: sections,
-                   autoColor: autoColor, repair: repair)
+                   autoColor: autoColor, repair: repair, intro: intro?.url.path, outro: outro?.url.path)
     }
 
     /// Arguments for `sermon_captions.py trim`: start a quarter frame early and
@@ -1490,6 +1581,8 @@ struct TrimEditor: View {
     /// What ▶ on a suggestion plays (remembered between runs).
     @AppStorage("suggestionPlaysAround") private var playAround = false
     @AppStorage(Model.captionsWithTrimKey) private var captionsWithTrim = true
+    /// The intro or outro being watched in its popover.
+    @State private var watching: ClipSlot?
 
     private func detailRange(_ now: Double?) -> ClosedRange<Double> {
         let at = now ?? c.current
@@ -1524,6 +1617,8 @@ struct TrimEditor: View {
                 Spacer()
                 Text("Length \(lengthText)")
                     .font(.system(.body, design: .monospaced)).foregroundStyle(.secondary)
+                    .help(c.intro == nil && c.outro == nil ? "How long the saved video will be"
+                          : "How long the saved video will be, with the intro and outro")
                     .frame(minWidth: 150, alignment: .trailing)
             }
 
@@ -1571,8 +1666,11 @@ struct TrimEditor: View {
 
             musicPanel
 
+            clipPanel
+
             HStack(spacing: 18) {
                 Toggle("Fade in and out (1 sec)", isOn: $c.fade)
+                    .help("Fades the sermon in at the start and out at the end. Where there's an intro or outro, it cuts straight to it instead.")
                 HStack(spacing: 6) {
                     Toggle("Even out the volume", isOn: $c.level)
                         .help("Brings the part you're keeping to a standard loudness, with a limiter for the loudest moments. Turn it on and off to compare.")
@@ -1790,8 +1888,81 @@ struct TrimEditor: View {
         .disabled(!c.ready)
     }
 
+    private var clipPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 28) {
+                clipSlot(.intro)
+                clipSlot(.outro)
+                Spacer()
+            }
+            if let note = c.clipNote {
+                Label(note, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
+            }
+        }
+        .disabled(!c.ready)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func clipSlot(_ slot: ClipSlot) -> some View {
+        let clip = slot == .intro ? c.intro : c.outro
+        let title = slot == .intro ? "Intro" : "Outro"
+        return HStack(spacing: 8) {
+            Image(systemName: clip == nil ? "film" : "film.fill")
+                .foregroundStyle(clip == nil ? Color.secondary : Color.accentColor)
+            Text(title).font(.headline)
+            if let clip {
+                Text(clip.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: 240, alignment: .leading)
+                    .help(clip.url.path)
+                Text(clockText(clip.duration)).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                Button {
+                    c.pause()
+                    watching = slot
+                } label: { Image(systemName: "play.fill") }
+                    .help("Watch the \(slot.name)")
+                    .popover(isPresented: Binding(get: { watching == slot }, set: { if !$0 && watching == slot { watching = nil } })) {
+                        ClipPlayer(url: clip.url)
+                    }
+                Button("Change…") { pickClip(slot) }
+                Button { useClip(slot, nil) } label: { Image(systemName: "trash") }
+                    .buttonStyle(.borderless).help("Take the \(slot.name) off")
+            } else {
+                Button("Add \(slot.name)…") { pickClip(slot) }
+                    .help(slot == .intro ? "A video to put before the sermon, as it is (or drop one here)"
+                                         : "A video to put after the sermon, as it is (or drop one here)")
+            }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let u = urls.first(where: { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .movie) == true })
+            else { return false }
+            useClip(slot, u)
+            return true
+        }
+    }
+
+    private func pickClip(_ slot: ClipSlot) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie]
+        panel.allowsMultipleSelection = false
+        panel.message = slot == .intro ? "Choose the video to put before the sermon"
+                                       : "Choose the video to put after the sermon"
+        if panel.runModal() == .OK, let u = panel.url { useClip(slot, u) }
+    }
+
+    private func useClip(_ slot: ClipSlot, _ url: URL?) {
+        Task {
+            if let why = await c.chooseClip(slot, url) { model.show(why, error: true) }
+        }
+    }
+
+    private func clockText(_ seconds: Double) -> String {
+        let s = Int(seconds.rounded())
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
     private var lengthText: String {
-        let s = Int(c.keptSeconds.rounded())
+        let s = Int(c.savedSeconds.rounded())
         return String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
     }
 
@@ -1892,6 +2063,23 @@ struct TrimEditor: View {
             }
             return handled ? nil : e
         }
+    }
+}
+
+/// Plays an intro or outro in a popover.
+struct ClipPlayer: View {
+    let url: URL
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        VideoPlayer(player: player)
+            .frame(width: 480, height: 270)
+            .onAppear {
+                let p = AVPlayer(url: url)
+                player = p
+                p.play()
+            }
+            .onDisappear { player?.pause() }
     }
 }
 

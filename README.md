@@ -34,6 +34,16 @@ xattr -dr com.apple.quarantine ~/Applications/"Sermon Captions.app"
 The first time you make captions, the app downloads a 1.6 GB speech model.
 "Repair the voice" downloads another 680 MB the first time you turn it on.
 
+## Intro and outro
+
+The trim editor can add a video before the sermon (an intro) or after it (an
+outro), like a testimony or a closing slide. They go in as they are, with a
+straight cut, sized and paced to match the sermon. With Even out the volume on,
+they're brought to the same loudness too. A new sermon starts with whichever
+intro and outro you used last, so a weekly one only has to be chosen once.
+
+Anything said in an intro or outro gets English captions too.
+
 ## Where things go
 
 - Each sermon gets a folder in `~/Movies/Sermon Captions/`, named after the English video.
