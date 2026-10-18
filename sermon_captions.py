@@ -45,8 +45,10 @@
       the retimed captions into SPANISH.
 
   sermon_captions.py send VIDEO
+  sermon_captions.py send --to FOLDER FILE...
       Copy the finished video to the ProPresenter Mac, as set up in
-      ~/Library/Application Support/Sermon Captions/ProPresenter/.
+      ~/Library/Application Support/Sermon Captions/ProPresenter/, or a
+      trimmed video and its captions into its sermon folder FOLDER.
 
 Progress goes to stdout, one message per line, for the app to read:
   STAGE <text>   PROGRESS <0..1>   WARN <text>   NOTE <text>   ERROR <text>   DONE
@@ -893,30 +895,49 @@ def ssh_args(cfg, via_jump):
     return ["/usr/bin/ssh", *target, f"{cfg['user']}@{cfg['host']}"]
 
 
-def send(video):
-    if not os.path.exists(video):
-        fail(f"Can't find {video}")
-    name = os.path.basename(video)
-    size = os.path.getsize(video)
+def send(*args):
+    """send VIDEO: the finished Spanish video into Movies/Spanish sermons.
+    send --to FOLDER FILE...: a trimmed video and its captions into
+    Movies/Sermon Captions/FOLDER, to finish there. Files go in the order
+    given (the video before its captions, so the captions are the newer)."""
+    to = None
+    if args[:1] == ("--to",) and len(args) > 2:
+        to, args = args[1], args[2:]
+    files = list(args)
+    for f in files:
+        if not os.path.exists(f):
+            fail(f"Can't find {f}")
+    sizes = [os.path.getsize(f) for f in files]
+    total = max(sum(sizes), 1)
     cfg = send_config()
-    if "folder" in cfg:
+    if "folder" in cfg:   # this is the ProPresenter Mac
         P.stage("Copying to ProPresenter…", 0.0, 1.0)
-        folder = os.path.expanduser(cfg["folder"])
+        if to:
+            shown = f"Movies/Sermon Captions/{to}"
+            folder = os.path.expanduser(f"~/{shown}")
+        else:
+            shown = cfg["folder"].replace("~/", "", 1)
+            folder = os.path.expanduser(cfg["folder"])
         os.makedirs(folder, exist_ok=True)
-        fd, part = tempfile.mkstemp(prefix=".upload.", dir=folder)
-        try:
-            with open(video, "rb") as src, os.fdopen(fd, "wb") as dst:
-                done = 0
-                while chunk := src.read(4 << 20):
-                    dst.write(chunk)
-                    done += len(chunk)
-                    P.set(done / size)
-            os.chmod(part, 0o644)
-            os.replace(part, os.path.join(folder, name))
-        finally:
-            if os.path.exists(part):
-                os.remove(part)
-        emit("NOTE", cfg["folder"].replace("~/", "", 1))
+        done = 0
+        for f in files:
+            dest = os.path.join(folder, os.path.basename(f))
+            if os.path.exists(dest) and os.path.samefile(f, dest):
+                done += os.path.getsize(f)
+                continue
+            fd, part = tempfile.mkstemp(prefix=".upload.", dir=folder)
+            try:
+                with open(f, "rb") as src, os.fdopen(fd, "wb") as dst:
+                    while chunk := src.read(4 << 20):
+                        dst.write(chunk)
+                        done += len(chunk)
+                        P.set(done / total)
+                os.chmod(part, 0o644)
+                os.replace(part, dest)
+            finally:
+                if os.path.exists(part):
+                    os.remove(part)
+        emit("NOTE", shown)
         return
 
     P.stage("Finding the ProPresenter Mac…", 0.0, 0.0)
@@ -933,44 +954,52 @@ def send(video):
             break
     if found is None:
         fail("Couldn't reach the ProPresenter Mac. It may be asleep or turned off. Away from church, "
-             "this Mac also needs Tailscale turned on. The video is still in this sermon's folder, "
+             "this Mac also needs Tailscale turned on. Everything is still in this sermon's folder, "
              "so you can try again with Copy to ProPresenter.")
-    if len(reply) > 1 and reply[1].isdigit() and int(reply[1]) * 1024 < size + (2 << 30):
+    if len(reply) > 1 and reply[1].isdigit() and int(reply[1]) * 1024 < total + (2 << 30):
         fail("The ProPresenter Mac is almost out of space.")
 
     P.stage("Copying to ProPresenter…", 0.0, 1.0)
-    proc = subprocess.Popen(ssh_args(cfg, found) + [f"upload {size} {name}"], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
-    CHILDREN.append(proc)
-    # Read its replies while sending, so a chatty ssh can't fill a pipe and stall both sides.
-    replies = {}
-    readers = [threading.Thread(target=lambda k, f: replies.__setitem__(k, f.read()[-4000:]), args=(k, f), daemon=True)
-               for k, f in (("out", proc.stdout), ("err", proc.stderr))]
-    for t in readers:
-        t.start()
-    try:
-        with open(video, "rb") as src:
-            done = 0
-            while chunk := src.read(1 << 20):
-                proc.stdin.write(chunk)
-                done += len(chunk)
-                P.set(done / size)
-    except BrokenPipeError:
-        pass   # the other end gave up; its message comes next
-    try:
-        proc.stdin.close()
-    except BrokenPipeError:
-        pass
-    proc.wait()
-    for t in readers:
-        t.join()
-    out, err = replies.get("out", b""), replies.get("err", b"")
-    out = out.decode(errors="replace").strip()
-    if proc.returncode != 0 or not out.startswith("saved "):
-        why = err.decode(errors="replace").strip().splitlines()
-        fail("Copying to the ProPresenter Mac stopped partway" + (f" ({why[-1]})" if why else "")
-             + ". Try again with Copy to ProPresenter.")
-    emit("NOTE", out[len("saved "):])
+    done, saved = 0, ""
+    for f, size in zip(files, sizes):
+        name = os.path.basename(f)
+        command = f"upload-to {size} {to}/{name}" if to else f"upload {size} {name}"
+        proc = subprocess.Popen(ssh_args(cfg, found) + [command], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
+        CHILDREN.append(proc)
+        # Read its replies while sending, so a chatty ssh can't fill a pipe and stall both sides.
+        replies = {}
+        readers = [threading.Thread(target=lambda k, h: replies.__setitem__(k, h.read()[-4000:]), args=(k, h),
+                                    daemon=True)
+                   for k, h in (("out", proc.stdout), ("err", proc.stderr))]
+        for t in readers:
+            t.start()
+        try:
+            with open(f, "rb") as src:
+                while chunk := src.read(1 << 20):
+                    proc.stdin.write(chunk)
+                    done += len(chunk)
+                    P.set(done / total)
+        except BrokenPipeError:
+            pass   # the other end gave up; its message comes next
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        proc.wait()
+        for t in readers:
+            t.join()
+        out = replies.get("out", b"").decode(errors="replace").strip()
+        if proc.returncode != 0 or not out.startswith("saved "):
+            why = replies.get("err", b"").decode(errors="replace").strip().splitlines()
+            if why and why[-1] == "not allowed":
+                why = ["the ProPresenter Mac needs its copy of Sermon Captions set up again"]
+            elif why and why[-1] == "bad name":
+                why = [f"it won't take a file named {name}"]
+            fail("Copying to the ProPresenter Mac stopped partway" + (f" ({why[-1]})" if why else "")
+                 + ". Try again with Copy to ProPresenter.")
+        saved = out[len("saved "):]
+    emit("NOTE", os.path.dirname(saved) if to else saved)
 
 
 FADE_SECONDS = 1.0
@@ -1978,15 +2007,15 @@ def main():
         transcribe(*sys.argv[2:])
     elif len(sys.argv) == 7 and sys.argv[1] == "spanish":
         spanish(*sys.argv[2:])
-    elif len(sys.argv) == 3 and sys.argv[1] == "send":
-        send(sys.argv[2])
+    elif len(sys.argv) >= 3 and sys.argv[1] == "send":
+        send(*sys.argv[2:])
     else:
         fail("usage: trim [--captions OUT.srt] [--repair VOICE.wav FROM] VIDEO OUT.mp4 START LENGTH FADE LEVEL LOOK.cube "
              "[MUSIC.wav AT AMOUNT]... | "
              "repair VIDEO START LENGTH OUT.wav [MUSIC.wav AT AMOUNT]... | "
              "separate VIDEO FROM TO OUT.wav [FROM TO OUT.wav]... | suggest VIDEO OUT.json | "
              "transcribe VIDEO OUT.srt | "
-             "spanish ORIG SPANISH EN.srt OUT.srt OUT.mp4 | send VIDEO")
+             "spanish ORIG SPANISH EN.srt OUT.srt OUT.mp4 | send VIDEO | send --to FOLDER FILE...")
     emit("DONE")
 
 

@@ -47,11 +47,18 @@ into its `Movies/Spanish sermons` folder. It goes over the church network
 when you're there, and over Tailscale when you're not. The checkbox and the
 Copy to ProPresenter button only show up on a Mac that's been set up for it.
 
+Step 2 has its own checkbox and button for when you trim on one Mac and
+finish on the ProPresenter Mac. They copy the trimmed video and its English
+captions into the same sermon folder there, under `Movies/Sermon Captions`.
+On the ProPresenter Mac, drop that video into step 2 and the captions come
+with it, so step 3 is ready to go. This one is off unless you turn it on,
+since a trimmed video is a few gigabytes.
+
 Setting up a Mac gives that copy of the app its own SSH key, kept in
 `~/Library/Application Support/Sermon Captions/ProPresenter/` with a
 `config.json` that says where the ProPresenter Mac is. On the ProPresenter
-Mac, that key can only run `propresenter-receive.sh`, which saves one `.mp4`
-into that folder and does nothing else. Jacob has the setup script, since it
+Mac, that key can only run `propresenter-receive.sh`, which saves one video
+or caption file into one of those folders and does nothing else. Jacob has the setup script, since it
 names the church's machines.
 
 ## Building it

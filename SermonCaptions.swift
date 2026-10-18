@@ -30,6 +30,12 @@ enum Paths {
     static var canCopyToProPresenter: Bool {
         FileManager.default.fileExists(atPath: proPresenter.appendingPathComponent("config.json").path)
     }
+    /// Set up to copy to a different Mac (not this one being the ProPresenter Mac).
+    static var copiesToOtherMac: Bool {
+        guard let data = try? Data(contentsOf: proPresenter.appendingPathComponent("config.json")),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return cfg["host"] != nil
+    }
 
     /// Music, voice repairs and color looks nobody has made or used in a month.
     /// They're only there to make a second save of the same sermon quick.
@@ -93,7 +99,7 @@ final class LineReader {
 
 @MainActor
 final class Model: ObservableObject {
-    enum Job { case trim, music, repair, suggest, english, spanish, copy }
+    enum Job { case trim, music, repair, suggest, english, spanish, copy, copyEnglish }
 
     /// The untrimmed video, straight from Subsplash.
     @Published var sourceVideo: URL? { didSet { sourceChanged(from: oldValue) } }
@@ -133,13 +139,19 @@ final class Model: ObservableObject {
     private var repairOut: URL?
     /// Where the copy job put the video on the ProPresenter Mac.
     private var lastNote: String?
-    /// How long making the Spanish video took, when copying follows it.
-    private var spanishTook: String?
+    /// What was just made, when copying it to ProPresenter follows.
+    private var readyNote: String?
 
     /// "Copy it to the ProPresenter Mac" in step 3 (on unless turned off).
     static let copyToProPresenterKey = "copyToProPresenter"
     static var copyToProPresenter: Bool {
         UserDefaults.standard.object(forKey: copyToProPresenterKey) as? Bool ?? true
+    }
+
+    /// "Copy the trimmed video and captions to the ProPresenter Mac" in step 2 (off unless turned on).
+    static let copyEnglishToProPresenterKey = "copyEnglishToProPresenter"
+    static var copyEnglishToProPresenter: Bool {
+        UserDefaults.standard.bool(forKey: copyEnglishToProPresenterKey)
     }
 
     /// "Also make the English captions" in the trim window (on unless turned off).
@@ -351,6 +363,13 @@ final class Model: ObservableObject {
         run(.copy, ["send", mp4.path], in: mp4.deletingLastPathComponent())
     }
 
+    /// The video in step 2 and its captions, into the same sermon folder on
+    /// the ProPresenter Mac, to finish step 3 there.
+    func copyEnglishToProPresenter() {
+        guard let v = englishVideo, let srt = englishSRT, let f = folder, job == nil, Paths.copiesToOtherMac else { return }
+        run(.copyEnglish, ["send", "--to", f.lastPathComponent, v.path, srt.path], in: f)
+    }
+
     /// Replace the English captions with an SRT the user edited elsewhere.
     func importEnglishSRT(_ url: URL) {
         guard let dest = englishSRTPath, url.standardizedFileURL != dest.standardizedFileURL else { return }
@@ -453,20 +472,16 @@ final class Model: ObservableObject {
         refresh()
         // Sections a stopped or failed separation did finish still count.
         if which == .music || which == .repair { trim?.refreshMusic() }
-        // Repair the voice was turned on (or the music changed) while
-        // something else was running: start it now (after the copy to ProPresenter, if one is next).
-        let copyNext = which == .spanish && !cancelled && status == 0
-            && Paths.canCopyToProPresenter && Self.copyToProPresenter
-        if !cancelled, status == 0, which != .repair, !copyNext, let c = trim, c.repair, c.repairNeeded, !c.musicNeedsSeparating {
-            DispatchQueue.main.async { [weak self] in self?.repairVoice() }
-        }
-        if which != .copy { spanishTook = nil }
+        let ok = !cancelled && status == 0
+        var copyNext = false, copyEnglishNext = false
+        if which != .copy && which != .copyEnglish { readyNote = nil }
         if cancelled {
-            spanishTook = nil
+            readyNote = nil
             show("Stopped.")
         } else if status == 0 {
             let took = Int(Date().timeIntervalSince(started))
             let time = took >= 60 ? "\(took / 60) min \(took % 60) sec" : "\(took) sec"
+            let place = lastNote.map { ", in \($0.replacingOccurrences(of: "/", with: " › "))" } ?? ""
             switch which {
             case .suggest:
                 trim?.loadSuggestions(savedSuggestions())
@@ -492,25 +507,34 @@ final class Model: ObservableObject {
                 show("English captions are ready (\(time)). Check them over, then upload the SRT to HeyGen.")
             case .spanish:
                 show("The Spanish video with English captions is ready (\(time)).")
-                if copyNext {
-                    spanishTook = time
-                    DispatchQueue.main.async { [weak self] in self?.copyToProPresenter() }
-                }
             case .copy:
-                let place = lastNote.map { " in \($0.replacingOccurrences(of: "/", with: " › "))" } ?? ""
-                if let took = spanishTook {
-                    show("The Spanish video with English captions is ready (\(took)) and copied to the ProPresenter Mac\(place).")
-                } else {
-                    show("Copied to the ProPresenter Mac\(place).")
+                show([readyNote, "Copied to the ProPresenter Mac\(place)."].compactMap { $0 }.joined(separator: " "))
+                readyNote = nil
+            case .copyEnglish:
+                show([readyNote, "Copied the video and its captions to the ProPresenter Mac\(place). To finish there, drop that video into step 2."]
+                    .compactMap { $0 }.joined(separator: " "))
+                readyNote = nil
+            }
+            // (Decided after the switch: a trim only loads its video into step 2 above.)
+            copyNext = which == .spanish && Paths.canCopyToProPresenter && Self.copyToProPresenter
+            copyEnglishNext = (which == .english || which == .trim) && Paths.copiesToOtherMac
+                && Self.copyEnglishToProPresenter && englishVideo != nil && englishSRT != nil && !englishIsStale
+            if copyNext || copyEnglishNext {
+                readyNote = message
+                DispatchQueue.main.async { [weak self] in
+                    if copyNext { self?.copyToProPresenter() } else { self?.copyEnglishToProPresenter() }
                 }
-                spanishTook = nil
             }
         } else {
             let why = lastError ?? stderrTail.joined(separator: "\n").ifEmpty("Something went wrong (exit \(status)).")
-            // The Spanish video itself is fine when only the copy failed.
-            show(spanishTook != nil ? "The Spanish video with English captions is ready, but it didn't get to ProPresenter. \(why)" : why,
-                 error: true)
-            spanishTook = nil
+            // What was made is fine when only the copy failed.
+            show(readyNote.map { "\($0) It didn't get to the ProPresenter Mac, though. \(why)" } ?? why, error: true)
+            readyNote = nil
+        }
+        // Repair the voice was turned on (or the music changed) while
+        // something else was running: start it now (after the copy to ProPresenter, if one is next).
+        if ok, which != .repair, !copyNext, !copyEnglishNext, let c = trim, c.repair, c.repairNeeded, !c.musicNeedsSeparating {
+            DispatchQueue.main.async { [weak self] in self?.repairVoice() }
         }
     }
 }
@@ -525,6 +549,7 @@ struct ContentView: View {
     @ObservedObject var model: Model
     @Environment(\.openWindow) private var openWindow
     @AppStorage(Model.copyToProPresenterKey) private var copyToProPresenter = true
+    @AppStorage(Model.copyEnglishToProPresenterKey) private var copyEnglishToProPresenter = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -580,6 +605,19 @@ struct ContentView: View {
                             return true
                         }
                         .help("Drag this into HeyGen. Drop an edited .srt here to replace it.")
+                    }
+                }
+                if Paths.copiesToOtherMac {
+                    HStack(spacing: 12) {
+                        Toggle("Copy the video and captions to the ProPresenter Mac when they're done", isOn: $copyEnglishToProPresenter)
+                            .font(.callout)
+                            .help("To finish step 3 on the ProPresenter Mac. They go into the same sermon folder there.")
+                        Spacer()
+                        if model.englishVideo != nil && model.englishSRT != nil {
+                            Button("Copy to ProPresenter") { model.copyEnglishToProPresenter() }
+                                .disabled(model.job != nil || model.englishIsStale)
+                                .help("Copies this video and its captions into Movies › Sermon Captions on the ProPresenter Mac.")
+                        }
                     }
                 }
                 if model.englishIsStale && model.job == nil {
