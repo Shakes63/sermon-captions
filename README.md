@@ -46,6 +46,15 @@ weekly one only has to be chosen once.
 
 Anything said in an intro or outro gets English captions too.
 
+## Caption styles
+
+Step 3 offers three looks for the captions on the Spanish video: Box (white
+text on a see-through black box, the easiest to read over a busy picture),
+Outline (white text with a thin black outline and no box) and Yellow (yellow
+text with a black outline). The app remembers your choice. If you switch
+styles after a video is made, step 3 says so, and Add English captions makes
+it again with the new one.
+
 ## Where things go
 
 - Each sermon gets a folder in `~/Movies/Sermon Captions/`, named after the English video.

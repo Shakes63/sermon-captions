@@ -143,6 +143,22 @@ final class Model: ObservableObject {
     /// What was just made, when copying it to ProPresenter follows.
     private var readyNote: String?
 
+    /// How the captions look on the Spanish video (step 3), and the style each
+    /// finished one was made with, by its path (none recorded: Box, the only
+    /// style before there was a choice).
+    static let captionStyleKey = "captionStyle"
+    static var captionStyle: CaptionStyle {
+        CaptionStyle(rawValue: UserDefaults.standard.string(forKey: captionStyleKey) ?? "") ?? .box
+    }
+    static let madeStylesKey = "spanishCaptionStyles"
+    static func madeStyle(_ video: URL) -> CaptionStyle {
+        let made = UserDefaults.standard.dictionary(forKey: madeStylesKey) as? [String: String] ?? [:]
+        return made[video.standardizedFileURL.path].flatMap(CaptionStyle.init(rawValue:)) ?? .box
+    }
+    /// The style the Spanish video being made now has, and when it started.
+    private var makingStyle: CaptionStyle?
+    private var makingSince: Date?
+
     /// "Copy it to the ProPresenter Mac" in step 3 (on unless turned off).
     static let copyToProPresenterKey = "copyToProPresenter"
     static var copyToProPresenter: Bool {
@@ -356,7 +372,11 @@ final class Model: ObservableObject {
     func makeSpanish() {
         guard let o = englishVideo, let s = spanishVideo, let en = englishSRT,
               let srt = spanishSRTPath, let mp4 = spanishOutPath else { return }
-        run(.spanish, ["spanish", o.path, s.path, en.path, srt.path, mp4.path], in: mp4.deletingLastPathComponent())
+        let style = Self.captionStyle
+        makingStyle = style
+        makingSince = Date()
+        run(.spanish, ["spanish", "--style", style.rawValue, o.path, s.path, en.path, srt.path, mp4.path],
+            in: mp4.deletingLastPathComponent())
     }
 
     func copyToProPresenter() {
@@ -474,6 +494,14 @@ final class Model: ObservableObject {
         // Sections a stopped or failed separation did finish still count.
         if which == .music || which == .repair { trim?.refreshMusic() }
         let ok = !cancelled && status == 0
+        // The style the Spanish video now has, going by the file itself (Stop
+        // right at the end can come after it's been written).
+        if which == .spanish, let mp4 = spanishOut, let style = makingStyle, let since = makingSince,
+           modified(mp4) >= since {
+            var made = UserDefaults.standard.dictionary(forKey: Self.madeStylesKey) as? [String: String] ?? [:]
+            made[mp4.standardizedFileURL.path] = style.rawValue
+            UserDefaults.standard.set(made, forKey: Self.madeStylesKey)
+        }
         var copyNext = false, copyEnglishNext = false
         if which != .copy && which != .copyEnglish { readyNote = nil }
         if cancelled {
@@ -550,6 +578,7 @@ struct ContentView: View {
     @ObservedObject var model: Model
     @Environment(\.openWindow) private var openWindow
     @AppStorage(Model.copyToProPresenterKey) private var copyToProPresenter = true
+    @AppStorage(Model.captionStyleKey) private var captionStyle = CaptionStyle.box
     @AppStorage(Model.copyEnglishToProPresenterKey) private var copyEnglishToProPresenter = false
 
     var body: some View {
@@ -633,6 +662,14 @@ struct ContentView: View {
                      detail: "After HeyGen, drop the Spanish video here. The same English captions get retimed to match it and burned in.") {
                 DropZone(title: "Spanish video from HeyGen", url: $model.spanishVideo, types: [.movie],
                          disabled: model.job != nil)
+                HStack(spacing: 12) {
+                    Text("Caption style").font(.callout).foregroundStyle(.secondary)
+                    ForEach(CaptionStyle.allCases) { style in
+                        CaptionStyleTile(style: style, selected: captionStyle == style) { captionStyle = style }
+                    }
+                    Spacer()
+                }
+                .disabled(model.job == .spanish)
                 HStack(alignment: .center, spacing: 12) {
                     Button("Add English captions") { model.makeSpanish() }
                         .fixedSize()
@@ -664,6 +701,12 @@ struct ContentView: View {
                         if let srt = model.spanishSRT { FileTile(url: srt, label: "Captions – Spanish timing") }
                         if let mp4 = model.spanishOut { FileTile(url: mp4, label: "Spanish video with captions") }
                     }
+                }
+                if let mp4 = model.spanishOut, model.job == nil, !model.spanishIsStale,
+                   Model.madeStyle(mp4) != captionStyle {
+                    Label("This Spanish video has the \(Model.madeStyle(mp4).title) captions. Click Add English captions to make it with \(captionStyle.title) instead.",
+                          systemImage: "info.circle")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
                 if model.spanishIsStale && model.job == nil {
                     Label("The English captions changed after this was made. Click Add English captions again to update it.",
@@ -789,6 +832,68 @@ struct DropZone: View {
         panel.allowsMultipleSelection = false
         panel.message = title
         if panel.runModal() == .OK, let u = panel.url { url = u }
+    }
+}
+
+/// The looks on offer for the captions on the Spanish video (the names
+/// `sermon_captions.py spanish --style` takes).
+enum CaptionStyle: String, CaseIterable, Identifiable {
+    case box, outline, yellow
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .box: "Box"
+        case .outline: "Outline"
+        case .yellow: "Yellow"
+        }
+    }
+    var help: String {
+        switch self {
+        case .box: "White text on a see-through black box, like YouTube and TV. The easiest to read over a busy picture."
+        case .outline: "White text with a thin black outline and no box, like Netflix and films."
+        case .yellow: "Yellow text with a black outline, like broadcast TV and DVDs."
+        }
+    }
+}
+
+/// A small picture of a caption style, to click.
+struct CaptionStyleTile: View {
+    let style: CaptionStyle
+    let selected: Bool
+    let action: () -> Void
+    @Environment(\.isEnabled) private var enabled
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                ZStack(alignment: .bottom) {
+                    LinearGradient(colors: [Color(white: 0.55), Color(red: 0.3, green: 0.35, blue: 0.4)],
+                                   startPoint: .top, endPoint: .bottom)
+                    sample.padding(.bottom, 8)
+                }
+                .frame(width: 112, height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6)
+                    .stroke(selected ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: selected ? 2.5 : 1))
+                Text(style.title).font(.caption).foregroundStyle(selected ? .primary : .secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .opacity(enabled ? 1 : 0.5)
+        .help(style.help)
+    }
+
+    @ViewBuilder private var sample: some View {
+        let text = Text("Caption text").font(.system(size: 12, weight: .bold))
+        switch style {
+        case .box:
+            text.foregroundStyle(.white).padding(.horizontal, 3).background(Color.black.opacity(0.5))
+        case .outline, .yellow:
+            text.foregroundStyle(style == .yellow ? Color.yellow : .white)
+                .shadow(color: .black, radius: 0, x: 1, y: 0).shadow(color: .black, radius: 0, x: -1, y: 0)
+                .shadow(color: .black, radius: 0, x: 0, y: 1).shadow(color: .black, radius: 0, x: 0, y: -1)
+                .shadow(color: .black.opacity(0.6), radius: 1, x: 1, y: 1)
+        }
     }
 }
 

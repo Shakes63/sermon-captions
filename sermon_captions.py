@@ -114,8 +114,19 @@ BOOKS = {
     "peter", "jude", "revelation", "revelations"}
 ORDINALS = {"1": "1", "2": "2", "3": "3", "first": "1", "second": "2", "third": "3",
             "1st": "1", "2nd": "2", "3rd": "3"}
-STYLE = ("FontName=Helvetica Neue,Bold=1,FontSize=18,BorderStyle=3,"
-         "Outline=2,Shadow=0,BackColour=&H80000000,MarginV=28")
+# How the captions look on the Spanish video (libass force_style; colours
+# are &HAABBGGRR, AA 00 = opaque). The app's step 3 picks one by name.
+CAPTION_STYLES = {
+    # White bold on a see-through black box (YouTube, TV).
+    "box": "FontName=Helvetica Neue,Bold=1,FontSize=18,BorderStyle=3,"
+           "Outline=2,Shadow=0,BackColour=&H80000000,MarginV=28",
+    # White with a thin black outline and a soft shadow, no box (Netflix, film).
+    "outline": "FontName=Helvetica Neue,Bold=1,FontSize=18,BorderStyle=1,PrimaryColour=&H00FFFFFF,"
+               "OutlineColour=&H00000000,Outline=1.2,BackColour=&H99000000,Shadow=0.8,MarginV=28",
+    # Yellow with a black outline (broadcast, DVD).
+    "yellow": "FontName=Helvetica Neue,Bold=1,FontSize=18,BorderStyle=1,PrimaryColour=&H0000FFFF,"
+              "OutlineColour=&H00000000,Outline=1.2,BackColour=&H99000000,Shadow=0.8,MarginV=28",
+}
 
 FILLERS = re.compile(r"(?i)(?<![\w'])(?:um+|uh+|erm|hmm+)(?![\w'])[,.]?\s*")
 # Doubled with a comma ("on, on") is a stumble, unless the word is one
@@ -830,7 +841,9 @@ def retime(text, t_orig, t_copy):
     return format_srt(cues)
 
 
-def spanish(orig, copy, en_srt, out_srt, out_mp4):
+def spanish(orig, copy, en_srt, out_srt, out_mp4, style="box"):
+    if style not in CAPTION_STYLES:
+        fail(f"There's no caption style called {style}.")
     for tool in (FFMPEG, FFPROBE):
         if not os.path.exists(tool):
             fail(f"Missing {tool}")
@@ -851,7 +864,7 @@ def spanish(orig, copy, en_srt, out_srt, out_mp4):
         partial = out_mp4 + ".partial.mp4"
         try:
             ffmpeg(["-i", copy, "-map", "0:V:0", "-map", "0:a:0?",
-                    "-vf", f"subtitles=captions.srt:force_style='{STYLE}'",
+                    "-vf", f"subtitles=captions.srt:force_style='{CAPTION_STYLES[style]}'",
                     "-c:v", "h264_videotoolbox", "-a53cc", "0", "-b:v", str(bps), "-profile:v", "high",
                     "-c:a", "copy", "-movflags", "+faststart", "-y", partial],
                    duration(copy), P.set, cwd=tmp)
@@ -2264,6 +2277,8 @@ def main():
         suggest(*sys.argv[2:])
     elif len(sys.argv) == 4 and sys.argv[1] == "transcribe":
         transcribe(*sys.argv[2:])
+    elif len(sys.argv) == 9 and sys.argv[1:3] == ["spanish", "--style"]:
+        spanish(*sys.argv[4:], style=sys.argv[3])
     elif len(sys.argv) == 7 and sys.argv[1] == "spanish":
         spanish(*sys.argv[2:])
     elif len(sys.argv) >= 3 and sys.argv[1] == "send":
@@ -2275,7 +2290,7 @@ def main():
              "repair VIDEO START LENGTH OUT.wav [MUSIC.wav AT AMOUNT]... | "
              "separate VIDEO FROM TO OUT.wav [FROM TO OUT.wav]... | suggest VIDEO OUT.json | "
              "transcribe VIDEO OUT.srt | "
-             "spanish ORIG SPANISH EN.srt OUT.srt OUT.mp4 | send VIDEO | send --to FOLDER FILE...")
+             "spanish [--style box|outline|yellow] ORIG SPANISH EN.srt OUT.srt OUT.mp4 | send VIDEO | send --to FOLDER FILE...")
     emit("DONE")
 
 
