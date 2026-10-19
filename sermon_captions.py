@@ -1050,16 +1050,31 @@ LIMITER = "alimiter=limit=0.8414:attack=5:release=50:level=disabled:latency=1"
 BT709 = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
 
 
+def rate_of(text):
+    """A frame rate as ffmpeg writes it ("30000/1001") in frames a second."""
+    a, _, b = text.partition("/")
+    try:
+        return float(a) / float(b or 1)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def frames_in(length, rate):
+    """How many frames at RATE trimming to LENGTH seconds keeps (with room
+    for ffprobe's rounding to the microsecond)."""
+    return max(int(-(-(length * rate - 0.01) // 1)), 1)
+
+
+def clip_frames(length, rate):
+    """How many frames at RATE the fps filter makes of a clip whose picture
+    ends at LENGTH: to the nearest frame, a half up as ffmpeg does it (with
+    room for ffprobe's rounding; the app counts the same way)."""
+    return max(int(length * rate + 0.5 + 1e-4), 1)
+
+
 def picture(video):
     """Width and height as shown (after any rotation) and the frame rate
     ffmpeg will give VIDEO's picture."""
-    def rate_of(text):
-        a, _, b = text.partition("/")
-        try:
-            return float(a) / float(b or 1)
-        except (ValueError, ZeroDivisionError):
-            return 0.0
-
     def run(cmd):
         return subprocess.run(cmd, capture_output=True, text=True).stdout
 
@@ -1112,9 +1127,12 @@ def add_clip(path, k, label, size, level, target=LOUDNESS_TARGET):
     sermon: same picture size and frame rate, letterboxed if the shape
     differs, 48 kHz stereo sound (silence if it has none), and brought to
     the same loudness when the sermon's volume is evened out. Ends in
-    [LABELv] and [LABELa]; returns the filters and the clip's length."""
+    [LABELv] and [LABELa], the same length to the frame; returns the
+    filters and how many frames that is."""
     w, h, rate = size
     length = picture_length(path)
+    frames = clip_frames(length, rate_of(rate))
+    sound = frames / rate_of(rate)
     # Untagged clips are taken the way players take them (HD as bt709);
     # tagged ones go by their tags.
     matrix = "auto"
@@ -1127,17 +1145,17 @@ def add_clip(path, k, label, size, level, target=LOUDNESS_TARGET):
     graph = (f"[{k}:V:0]scale=trunc(iw*sar/2)*2:ih,setsar=1,"
              f"scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
              f":in_color_matrix={matrix}:out_color_matrix=bt709:out_range=tv,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-             f"fps={rate}:start_time=0,format=yuv420p,{BT709},trim=duration={length:.6f}[{label}v];")
+             f"fps={rate}:start_time=0,format=yuv420p,{BT709},trim=end_frame={frames},settb=AVTB[{label}v];")
     if has_sound(path):
         gain = ""
         lufs = loudness(path) if level else None
         if lufs is not None:
             gain = f",volume={min(max(target - lufs, -12), 18):.2f}dB,{LIMITER}"
         graph += (f"[{k}:a:0]aresample=async=1:first_pts=0,{stereo(path)}{gain},apad,"
-                  f"atrim=duration={length:.6f}[{label}a];")
+                  f"atrim=duration={sound:.6f}[{label}a];")
     else:
-        graph += f"anullsrc=r={RATE}:cl=stereo,aformat=sample_fmts=flt,atrim=duration={length:.6f}[{label}a];"
-    return graph, length
+        graph += f"anullsrc=r={RATE}:cl=stereo,aformat=sample_fmts=flt,atrim=duration={sound:.6f}[{label}a];"
+    return graph, frames
 
 
 # What Whisper writes for music or silence instead of words.
@@ -1145,7 +1163,7 @@ NOT_SPEECH = re.compile(r"\s*(\[[^\]]*\]|\([^)]*\)|[♪♫\s*]+)\s*")
 
 
 def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None, repair=None,
-         intro=None, outro=None):
+         intro=None, outro=None, intro_fade=0.0, outro_fade=0.0):
     for tool in (FFMPEG, FFPROBE) + ((WHISPER,) if captions else ()):
         if not os.path.exists(tool):
             fail(f"Missing {tool}")
@@ -1171,7 +1189,7 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
         # One fixed change (what the trim window previews), then a limiter
         # 1.5 dB under full scale for peaks the boost pushes too far.
         af += [f"volume={float(level):.2f}dB", LIMITER]
-    # An intro or outro cuts straight to the sermon, so that end doesn't fade.
+    # An intro or outro cuts or crossfades to the sermon, so that end doesn't fade.
     if fade == "1" and length > 2 * FADE_SECONDS:
         end = length - FADE_SECONDS
         if not intro:
@@ -1210,37 +1228,83 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
         graph = ""   # no sound in, none out
     graph += "[0:V:0]" + (",".join(vf) or "null") + "[sv]"
     # What the captions are made from: (video, from, length, where it lands, name).
-    pieces = [(video, start, length, 0.0, "sermon")]
+    pieces = [(video, start, length, 0.0, "sermon", 0.0, length)]
     total = length
     if not (intro or outro):
         maps = ["-map", "[sv]"] + (["-map", "[sa]"] if "[sa]" in graph else [])
     else:
-        # Joined with a straight cut: the clips are made to match the
-        # sermon's picture and sound, then all of it goes through concat.
+        # The clips are made to match the sermon's picture and sound, each
+        # piece exactly a whole number of frames long, then joined with a
+        # straight cut or a crossfade.
         size = picture(video)
+        rate = rate_of(size[2])
         # The app evens out a mono sermon measured as mono; doubled onto both
         # sides here it plays 3 dB louder, so the clips go 3 dB louder too.
         target = LOUDNESS_TARGET
         if not repair and sermon_sound and probe(video, "stream=channels", "a:0").split("\n")[0] == "1":
             target += 3
-        graph += (f";[sv]setsar=1,fps={size[2]}:start_time=0,format=yuv420p,{BT709}[mv];"
-                  f"[sa]aresample={RATE}:async=1:first_pts=0,aformat=sample_fmts=flt:channel_layouts=stereo[ma];")
-        parts, pieces, total = [], [], 0.0
+        frames = frames_in(length, rate)
+        graph += (f";[sv]setsar=1,fps={size[2]}:start_time=0,format=yuv420p,{BT709},"
+                  f"trim=end_frame={frames},settb=AVTB[mv];"
+                  f"[sa]aresample={RATE}:async=1:first_pts=0,aformat=sample_fmts=flt:channel_layouts=stereo,"
+                  f"apad,atrim=duration={frames / rate:.6f}[ma];")
+        parts = []   # (label, frames, video, from, name)
         for label, path in (("intro", intro), ("m", None), ("outro", outro)):
             if label == "m":
-                parts.append("[mv][ma]")
-                if sermon_sound:   # a silent sermon has nothing to caption
-                    pieces.append((video, start, length, total, "sermon"))
-                total += length
+                parts.append(("m", frames, video, start, "sermon"))
             elif path:
-                filters, clip = add_clip(path, args.count("-i"), label, size, level != "-", target)
+                filters, n = add_clip(path, args.count("-i"), label, size, level != "-", target)
                 args += ["-i", path]
                 graph += filters
-                parts.append(f"[{label}v][{label}a]")
-                if captions and has_sound(path) and loudness(path) is not None:   # a silent track has nothing to caption
-                    pieces.append((path, 0.0, clip, total, label))
-                total += clip
-        graph += "".join(parts) + f"concat=n={len(parts)}:v=1:a=1[v][a]"
+                parts.append((label, n, path, 0.0, label))
+        # A crossfade is whole frames, no longer than the clip or half the sermon.
+        def overlap(seconds, clip):
+            return min(int(float(seconds) * rate + 0.5), clip, frames // 2) if float(seconds) > 0 else 0
+        fades = [overlap(intro_fade, parts[0][1]) if intro else 0] * (len(parts) - 1)
+        if outro:
+            fades[-1] = overlap(outro_fade, parts[-1][1])
+        # Each piece lands where the one before it ends, less the crossfade.
+        lands, at = [], 0
+        for k, part in enumerate(parts):
+            at -= fades[k - 1] if k else 0
+            lands.append(at)
+            at += part[1]
+        total = at / rate
+        cur = parts[0][0]
+        for k, part in enumerate(parts[1:]):
+            d, nxt, j = fades[k], part[0], f"j{k}"
+            if d:
+                # Only the overlap goes through xfade (it works in 4:4:4, so
+                # the rest of the picture is left alone); the sound crossfades
+                # equal-power.
+                at = lands[k + 1]   # where the overlap starts in what's joined so far
+                graph += (f"[{cur}v]split[{j}p][{j}q];[{j}p]trim=end_frame={at}[{j}b];"
+                          f"[{j}q]trim=start_frame={at},setpts=PTS-STARTPTS[{j}t];"
+                          f"[{nxt}v]split[{j}r][{j}s];[{j}r]trim=end_frame={d}[{j}h];"
+                          f"[{j}s]trim=start_frame={d},setpts=PTS-STARTPTS[{j}n];"
+                          f"[{j}t][{j}h]xfade=transition=fade:duration={d / rate:.6f}:offset=0,"
+                          f"format=yuv420p,settb=AVTB[{j}x];"
+                          f"[{j}b][{j}x][{j}n]concat=n=3:v=1:a=0[{j}v];"
+                          f"[{cur}a][{nxt}a]acrossfade=d={d / rate:.6f}:c1=qsin:c2=qsin[{j}a];")
+            else:
+                graph += f"[{cur}v][{cur}a][{nxt}v][{nxt}a]concat=n=2:v=1:a=1[{j}v][{j}a];"
+            cur = j
+        # Every piece is the same frame rate, so the picture is stamped by
+        # frame count (concat gives a one-frame piece no length otherwise).
+        num, _, den = size[2].partition("/")
+        graph = graph.rstrip(";").replace(f"[{cur}a]", "[a]") + f";[{cur}v]settb={den or 1}/{num},setpts=N[v]"
+        # What's said in each piece is captioned from where its crossfades
+        # are half done, so no caption runs into the next piece's.
+        pieces = []
+        for k, (label, n, path, from_, name) in enumerate(parts):
+            if label == "m" and not sermon_sound:
+                continue   # a silent sermon has nothing to caption
+            if label != "m" and not (captions and has_sound(path) and loudness(path) is not None):
+                continue   # nor does a silent clip
+            span = length if label == "m" else n / rate
+            first = fades[k - 1] / 2 / rate if k else 0.0
+            last = span - (fades[k] / 2 / rate if k < len(fades) else 0.0)
+            pieces.append((path, from_, span, lands[k] / rate, name, first, last))
         maps = ["-map", "[v]", "-map", "[a]"]
     args += ["-filter_complex", graph] + maps
     args += ["-c:v", "h264_videotoolbox", "-a53cc", "0", "-b:v", str(video_bitrate(video)), "-profile:v", "high",
@@ -1262,16 +1326,18 @@ def trim(video, out_mp4, start, length, fade, level, look, *music, captions=None
             # moved to where it lands in the saved video.
             cues, done = [], 0.0
             whole = sum(piece[2] for piece in pieces)
-            for path, at, span, lands, name in pieces:
+            for path, at, span, lands, name, first, last in pieces:
                 try:
                     part = captions_text(path, at, span,
                                          lambda f: frac.__setitem__("captions", (done + f * span) / whole))
                     # None runs past its own piece into the next.
                     for cue in parse_srt(part):
                         t0, t1 = (srt_seconds(x.strip()) for x in cue[0].split("-->"))
-                        if t0 >= span - 0.05 or all(NOT_SPEECH.fullmatch(line) for line in cue[1]):
+                        if t0 >= last - 0.05 or (first and t1 <= first + 0.05) \
+                                or all(NOT_SPEECH.fullmatch(line) for line in cue[1]):
                             continue
-                        cues.append([f"{srt_time(t0 + lands)} --> {srt_time(min(t1, span) + lands)}", cue[1]])
+                        cues.append([f"{srt_time(max(t0, first) + lands)} --> {srt_time(min(t1, last) + lands)}",
+                                     cue[1]])
                 except Exception as e:
                     if name == "sermon":
                         raise
@@ -2163,19 +2229,33 @@ def separate_one(video, fmt, model, start, end, out_wav, lo, hi, which):
 def main():
     args = sys.argv[2:]
     captions = repaired = intro = outro = None
-    while sys.argv[1:2] == ["trim"] and args[:1] in (["--captions"], ["--repair"], ["--intro"], ["--outro"]):
+    intro_fade = outro_fade = 0.0
+    while sys.argv[1:2] == ["trim"] and args[:1] in (["--captions"], ["--repair"], ["--intro"], ["--outro"],
+                                                     ["--intro-crossfade"], ["--outro-crossfade"]):
         if args[0] == "--captions" and len(args) > 1:
             captions, args = args[1], args[2:]
         elif args[0] == "--intro" and len(args) > 1:
             intro, args = args[1], args[2:]
         elif args[0] == "--outro" and len(args) > 1:
             outro, args = args[1], args[2:]
+        elif args[0] in ("--intro-crossfade", "--outro-crossfade") and len(args) > 1:
+            try:
+                seconds = float(args[1])
+                assert 0 <= seconds <= 10
+            except (ValueError, AssertionError):
+                fail(f"{args[0]} takes a number of seconds (0 to 10), not {args[1]}.")
+            if args[0] == "--intro-crossfade":
+                intro_fade = seconds
+            else:
+                outro_fade = seconds
+            args = args[2:]
         elif args[0] == "--repair" and len(args) > 2:
             repaired, args = (args[1], args[2]), args[3:]
         else:
             break
     if sys.argv[1:2] == ["trim"] and len(args) >= 7 and (len(args) - 7) % 3 == 0:
-        trim(*args, captions=captions, repair=repaired, intro=intro, outro=outro)
+        trim(*args, captions=captions, repair=repaired, intro=intro, outro=outro,
+             intro_fade=intro_fade, outro_fade=outro_fade)
     elif len(sys.argv) >= 6 and (len(sys.argv) - 6) % 3 == 0 and sys.argv[1] == "repair":
         repair(*sys.argv[2:])
     elif len(sys.argv) >= 6 and (len(sys.argv) - 3) % 3 == 0 and sys.argv[1] == "separate":
@@ -2189,7 +2269,8 @@ def main():
     elif len(sys.argv) >= 3 and sys.argv[1] == "send":
         send(*sys.argv[2:])
     else:
-        fail("usage: trim [--captions OUT.srt] [--repair VOICE.wav FROM] [--intro CLIP] [--outro CLIP] VIDEO OUT.mp4 START LENGTH FADE LEVEL LOOK.cube "
+        fail("usage: trim [--captions OUT.srt] [--repair VOICE.wav FROM] [--intro CLIP [--intro-crossfade SECONDS]] "
+             "[--outro CLIP [--outro-crossfade SECONDS]] VIDEO OUT.mp4 START LENGTH FADE LEVEL LOOK.cube "
              "[MUSIC.wav AT AMOUNT]... | "
              "repair VIDEO START LENGTH OUT.wav [MUSIC.wav AT AMOUNT]... | "
              "separate VIDEO FROM TO OUT.wav [FROM TO OUT.wav]... | suggest VIDEO OUT.json | "

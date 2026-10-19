@@ -3,6 +3,7 @@
 // those English captions retimed and burned in. The work is done by
 // sermon_captions.py (bundled in Resources); this is the window around it.
 
+import AVFoundation
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
@@ -615,6 +616,7 @@ struct ContentView: View {
                         Spacer()
                         if model.englishVideo != nil && model.englishSRT != nil {
                             Button("Copy to ProPresenter") { model.copyEnglishToProPresenter() }
+                                .fixedSize()
                                 .disabled(model.job != nil || model.englishIsStale)
                                 .help("Copies this video and its captions into Movies › Sermon Captions on the ProPresenter Mac.")
                         }
@@ -644,16 +646,20 @@ struct ContentView: View {
                     Spacer()
                 }
                 if Paths.canCopyToProPresenter {
-                    Toggle("Copy it to the ProPresenter Mac when it's done", isOn: $copyToProPresenter)
-                        .font(.callout)
-                }
-                if model.spanishSRT != nil || model.spanishOut != nil {
                     HStack(spacing: 12) {
-                        if model.spanishOut != nil && Paths.canCopyToProPresenter {
+                        Toggle("Copy it to the ProPresenter Mac when it's done", isOn: $copyToProPresenter)
+                            .font(.callout)
+                        Spacer()
+                        if model.spanishOut != nil {
                             Button("Copy to ProPresenter") { model.copyToProPresenter() }
+                                .fixedSize()
                                 .disabled(model.job != nil)
                                 .help("Copies this video to the ProPresenter Mac's Movies › Spanish sermons folder.")
                         }
+                    }
+                }
+                if model.spanishSRT != nil || model.spanishOut != nil {
+                    HStack(spacing: 12) {
                         Spacer()
                         if let srt = model.spanishSRT { FileTile(url: srt, label: "Captions – Spanish timing") }
                         if let mp4 = model.spanishOut { FileTile(url: mp4, label: "Spanish video with captions") }
@@ -871,6 +877,12 @@ struct SermonCaptionsApp: App {
             Snapshot.renderTrim(to: args[i + 1], video: args[i + 2], intro: args.dropFirst(i + 3).first)
             exit(0)
         }
+        // `--preview-trim out.mov video in out intro outro introFade outroFade`
+        // exports what the trim window plays, to check it against the save.
+        if let i = args.firstIndex(of: "--preview-trim"), i + 8 < args.count {
+            Snapshot.exportPreview(Array(args[(i + 1)...(i + 8)]))
+            exit(0)
+        }
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
             Snapshot.render(to: args[i + 1], english: args.dropFirst(i + 2).first,
                             spanish: args.dropFirst(i + 3).first)
@@ -933,6 +945,56 @@ enum Snapshot {
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
         host.cacheDisplay(in: host.bounds, to: rep)
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    }
+
+    static func exportPreview(_ a: [String]) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let model = Model()
+        model.sourceVideo = URL(fileURLWithPath: a[1])
+        model.prepareTrim()
+        guard let c = model.trim else { return }
+        c.onChange = nil
+        while !c.ready { RunLoop.current.run(until: Date().addingTimeInterval(0.1)) }
+        c.setOut(c.duration)
+        c.setIn(Double(a[2])!)
+        c.setOut(Double(a[3])!)
+        c.fade = true
+        c.autoColor = true
+        c.level = true
+        var set = false
+        Task {
+            for (slot, path) in [(ClipSlot.intro, a[4]), (.outro, a[5])] {
+                _ = await c.chooseClip(slot, path == "-" ? nil : URL(fileURLWithPath: path), remember: false)
+            }
+            c.setCrossfade(.intro, Double(a[6])!, remember: false)
+            c.setCrossfade(.outro, Double(a[7])!, remember: false)
+            _ = await c.ensureLevel()
+            _ = await c.ensureColor()
+            set = true
+        }
+        while !set { RunLoop.current.run(until: Date().addingTimeInterval(0.1)) }
+        RunLoop.current.run(until: Date().addingTimeInterval(4))   // clip loudness, player rebuilt
+        c.preview.update {
+            $0.playing = true
+            $0.showClips = true
+        }
+        guard let item = c.player.currentItem,
+              let session = AVAssetExportSession(asset: item.asset, presetName: AVAssetExportPresetHighestQuality)
+        else { print("EXPORT no player item"); return }
+        let out = URL(fileURLWithPath: a[0])
+        try? FileManager.default.removeItem(at: out)
+        session.outputURL = out
+        session.outputFileType = .mov
+        session.videoComposition = item.videoComposition
+        session.audioMix = item.audioMix
+        print("ITEM", item.asset is AVComposition, item.videoComposition != nil, c.savedSeconds)
+        print("TRIM", (c.clipArgs + [String(format: "%.6f", c.exportStart), String(format: "%.6f", c.exportLength),
+                                     c.levelArg, c.colorArg]).joined(separator: " "))
+        var done = false
+        session.exportAsynchronously { done = true }
+        while !done { RunLoop.current.run(until: Date().addingTimeInterval(0.2)) }
+        print("EXPORT", session.status.rawValue, session.error.map { "\($0)" } ?? "")
     }
 
     static func render(to path: String, english: String?, spanish: String?) {

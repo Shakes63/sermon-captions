@@ -37,10 +37,12 @@ The first time you make captions, the app downloads a 1.6 GB speech model.
 ## Intro and outro
 
 The trim editor can add a video before the sermon (an intro) or after it (an
-outro), like a testimony or a closing slide. They go in as they are, with a
-straight cut, sized and paced to match the sermon. With Even out the volume on,
-they're brought to the same loudness too. A new sermon starts with whichever
-intro and outro you used last, so a weekly one only has to be chosen once.
+outro), like a testimony or a closing slide. They go in as they are, sized and
+paced to match the sermon, with a straight cut or a crossfade of ½, 1 or 2
+seconds. Play the transition shows the join in the trim window the way it will
+be saved. With Even out the volume on, they're brought to the same loudness too.
+A new sermon starts with the intro, outro and crossfades you used last, so a
+weekly one only has to be chosen once.
 
 Anything said in an intro or outro gets English captions too.
 

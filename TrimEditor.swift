@@ -1,7 +1,7 @@
 // The trim window: a player plus two timelines (the whole video, and a
 // zoomed-in strip around the playhead) for picking the start and end frame,
 // sections where music behind the speaking can be turned down, and an intro
-// and outro to put before and after it.
+// and outro to put before and after it (cut or crossfaded, played in place).
 
 import AVFoundation
 import AVKit
@@ -21,6 +21,10 @@ struct TrimPoints: Codable {
     var repair: Bool?
     var intro: String?
     var outro: String?
+    /// The crossfade into the sermon and out to the outro, in seconds (0 or
+    /// missing: a straight cut).
+    var introFade: Double?
+    var outroFade: Double?
     // A single section, as saved by the first version with music.
     var musicFrom: Double?
     var musicTo: Double?
@@ -85,6 +89,29 @@ enum ClipSlot {
     var name: String { self == .intro ? "intro" : "outro" }
     /// The last one chosen, which a new sermon starts with.
     var defaultsKey: String { self == .intro ? "lastIntro" : "lastOutro" }
+    /// Likewise its crossfade.
+    var fadeKey: String { self == .intro ? "lastIntroFade" : "lastOutroFade" }
+    /// The crossfades on offer, in seconds (0 = a straight cut).
+    static let fades = [0.0, 0.5, 1, 2]
+}
+
+/// An intro or outro as the player has it: where the clip's own time zero
+/// sits in the source video's time.
+struct ClipPlan: Equatable {
+    let slot: ClipSlot
+    let url: URL
+    /// The sermon frame the clip's time zero lands on (can be before 0).
+    let frame: Int
+}
+
+/// What the player needs to show the intro and outro: the picture's size,
+/// each picture track and where it goes, and the clips' sound tracks.
+struct JoinPicture {
+    let size: CGSize
+    let duration: CMTime
+    let sermon: JoinInstruction.Placed
+    let clips: [ClipSlot: JoinInstruction.Placed]
+    let sound: [ClipSlot: CMPersistentTrackID]
 }
 
 /// Owns the player and the start/end points. Times are always snapped to the
@@ -173,8 +200,13 @@ final class TrimController: ObservableObject {
     @Published var endPick = 0
     @Published private(set) var intro: Clip?
     @Published private(set) var outro: Clip?
+    /// The crossfades into and out of the sermon, in seconds (0 = a cut).
+    @Published private(set) var introFade = 0.0
+    @Published private(set) var outroFade = 0.0
     /// Set when a saved intro or outro can't be found any more.
     @Published private(set) var clipNote: String?
+    /// Set when the player can't show the intro and outro.
+    @Published private(set) var joinNote: String?
     var onChange: (() -> Void)?
 
     private var observer: Any?
@@ -202,6 +234,16 @@ final class TrimController: ObservableObject {
     private var playingSection: UUID?
     /// Set once the window has moved on to another video.
     private var closed = false
+    /// The intro and outro in what the player is playing, and where they were
+    /// put when it was built.
+    private var joinPicture: JoinPicture?
+    private var builtClips: [ClipPlan]?
+    /// Each intro's and outro's loudness (LUFS) as the save measures it, or
+    /// -infinity if it's silent; and the ones being measured.
+    private var clipLoudness: [URL: Double] = [:]
+    private var clipMeasuring: Set<URL> = []
+    /// The sermon's sound is one channel (the save doubles it onto both sides).
+    private var sermonMono = false
 
     init(url: URL, saved: TrimPoints?) {
         self.url = url
@@ -239,8 +281,11 @@ final class TrimController: ObservableObject {
     func snap(_ t: Double) -> Double { time(min(max(frame(t), 0), lastFrame)) }
     var keptFrames: Int { frame(outPoint) - frame(inPoint) + 1 }
     var keptSeconds: Double { Double(keptFrames) / fps }
-    /// The saved video's length, with the intro and outro.
-    var savedSeconds: Double { keptSeconds + (intro?.duration ?? 0) + (outro?.duration ?? 0) }
+    /// The saved video's length, with the intro and outro less the crossfades.
+    var savedSeconds: Double {
+        Double(keptFrames + (intro.map(clipFrames) ?? 0) + (outro.map(clipFrames) ?? 0)
+               - overlapFrames(.intro) - overlapFrames(.outro)) / fps
+    }
 
     // MARK: loading
 
@@ -269,6 +314,8 @@ final class TrimController: ObservableObject {
             level = saved.level
             autoColor = saved.autoColor ?? false
             repair = saved.repair ?? false
+            introFade = saved.introFade ?? 0
+            outroFade = saved.outroFade ?? 0
             var list = saved.musicSections ?? []
             if list.isEmpty, let a = saved.musicFrom, let b = saved.musicTo {
                 list = [MusicSection(from: a, to: b, choice: MusicChoice(rawValue: saved.music ?? "") ?? .original)]
@@ -287,6 +334,8 @@ final class TrimController: ObservableObject {
             autoColor = true
             // And with the intro and outro the last sermon had.
             clips = [ClipSlot.intro, .outro].map { ($0, UserDefaults.standard.string(forKey: $0.defaultsKey)) }
+            introFade = UserDefaults.standard.double(forKey: ClipSlot.intro.fadeKey)
+            outroFade = UserDefaults.standard.double(forKey: ClipSlot.outro.fadeKey)
         }
         var lost: [String] = []
         for (slot, path) in clips {
@@ -299,8 +348,10 @@ final class TrimController: ObservableObject {
             }
         }
         clipNote = lost.isEmpty ? nil : lost.joined(separator: " ")
-        assetSoundTrack = try? await asset.loadTracks(withMediaType: .audio).first?.trackID
+        let sound = try? await asset.loadTracks(withMediaType: .audio).first
+        assetSoundTrack = sound?.trackID
         soundTrack = assetSoundTrack
+        if let sound { sermonMono = await Self.channels(sound) == 1 }
         ready = true
         checkSuggestions()
         updatePreview()
@@ -317,27 +368,43 @@ final class TrimController: ObservableObject {
 
     /// A seek issued before the player item is ready can be dropped, so show
     /// the current frame again once it is (and report a file it can't play).
-    /// After swapping items, `resume` picks up where the old one was.
-    private func watchItem(resume: (time: Double, rate: Float)? = nil) {
+    /// After swapping items, `resume` picks up where the old one was: the
+    /// frame the user has got to since, playing again unless they've
+    /// played or paused in the meantime.
+    private func watchItem(resume: (rate: Float, moves: Int)? = nil) {
         itemWatch?.cancel()
         guard let item = player.currentItem else { return }
         itemWatch = Task { [weak self] in
             for await status in item.publisher(for: \.status).values {
                 guard let self, !Task.isCancelled else { return }
+                if status != .unknown {
+                    self.swapping = false
+                    self.pendingResume = nil
+                }
                 if status == .readyToPlay {
                     if let resume {
-                        self.seek(resume.time)
-                        if resume.rate != 0 { self.player.rate = resume.rate }
+                        self.seek(self.current)
+                        if resume.rate != 0 && self.transportMoves == resume.moves { self.player.rate = resume.rate }
                     } else if !self.playing {
                         self.seek(self.current)
                     }
                     return
                 }
                 if status == .failed {
-                    if !self.musicTracks.isEmpty {
+                    if !self.musicTracks.isEmpty || self.joinPicture != nil {
                         // Fall back to the plain video; saving doesn't use the preview.
-                        self.musicPreviewNote = "The preview of the separated music couldn't play. Saving still works."
-                        self.swapItem(AVPlayerItem(asset: self.asset), tracks: [:], sound: self.assetSoundTrack)
+                        if !self.musicTracks.isEmpty {
+                            self.musicPreviewNote = "The preview of the separated music couldn't play. Saving still works."
+                        }
+                        if self.joinPicture != nil {
+                            self.joinNote = "The preview of the intro and outro couldn't play. Saving still works."
+                        }
+                        // Carry on as the failed item would have.
+                        if let resume {
+                            self.swapping = true
+                            self.pendingResume = resume
+                        }
+                        self.swapItem(AVPlayerItem(asset: self.asset), tracks: [:], sound: self.assetSoundTrack, join: nil)
                     } else {
                         self.loadError = "Couldn't play \(self.url.lastPathComponent): "
                             + (item.error?.localizedDescription ?? "unknown error")
@@ -349,12 +416,30 @@ final class TrimController: ObservableObject {
     }
 
     private var assetSoundTrack: CMPersistentTrackID?
+    /// Between swapping the player's item and the new one being ready, and
+    /// how to carry on once it is.
+    private var swapping = false
+    private var pendingResume: (rate: Float, moves: Int)?
+    /// Counts play and pause, so a swap's resume doesn't undo a newer one.
+    private var transportMoves = 0
 
-    private func swapItem(_ item: AVPlayerItem, tracks: [UUID: CMPersistentTrackID], sound: CMPersistentTrackID?) {
-        let resume = (time: current, rate: player.rate)
+    private func swapItem(_ item: AVPlayerItem, tracks: [UUID: CMPersistentTrackID], sound: CMPersistentTrackID?,
+                          join: JoinPicture?) {
+        // A swap before the last one was ready carries that one's resume on
+        // (unless play or pause was pressed since).
+        let resume: (rate: Float, moves: Int)
+        if swapping, let p = pendingResume, p.moves == transportMoves {
+            resume = p
+        } else {
+            resume = (rate: player.rate, moves: transportMoves)
+        }
+        pendingResume = resume
+        swapping = true
         player.pause()   // not self.pause(): a running "play section" should carry on
         musicTracks = tracks
         soundTrack = sound
+        joinPicture = join
+        updatePreview()
         player.replaceCurrentItem(with: item)
         applyMix()
         applyLook()
@@ -402,8 +487,8 @@ final class TrimController: ObservableObject {
     nonisolated static let samplesPerPeak = Int(Double(waveRate) / peaksPerSecond)
 
     /// Recompute the drawn waveform from the original: each separated
-    /// section mixed in at its choice, then the volume change, fades and
-    /// limiter inside the part being kept, as Save will do it.
+    /// section mixed in at its choice, then the volume change, limiter,
+    /// fades and crossfades inside the part being kept, as Save will do it.
     private func redrawWaveform() {
         guard !rawPeaks.isEmpty else { return }
         var lin = rawPeaks
@@ -436,17 +521,16 @@ final class TrimController: ObservableObject {
                 }
             }
         }
-        let s = preview.settings
-        if s.gain != 1 || s.fade {
-            let lo = max(Int(s.start * Self.peaksPerSecond), 0)
-            let hi = min(Int(s.end * Self.peaksPerSecond), lin.count - 1)
-            if lo <= hi {
-                for b in lo...hi {
-                    let t = (Double(b) + 0.5) / Self.peaksPerSecond
-                    var v = lin[b] * s.gain * Float(s.fadeLevel(t))
-                    if s.gain > 1 { v = min(v, PreviewSettings.limit) }
-                    lin[b] = v
-                }
+        var s = preview.settings
+        s.showClips = false
+        let lo = max(Int(s.start * Self.peaksPerSecond), 0)
+        let hi = min(Int(s.end * Self.peaksPerSecond), lin.count - 1)
+        if lo <= hi {
+            for b in lo...hi {
+                let t = (Double(b) + 0.5) / Self.peaksPerSecond
+                var v = lin[b] * s.gain
+                if s.limit { v = min(v, PreviewSettings.limit) }
+                lin[b] = v * Float(s.sermonLevel(t))
             }
         }
         peaks = lin.map { $0.squareRoot() }
@@ -506,6 +590,9 @@ final class TrimController: ObservableObject {
     private func tick(_ t: Double) {
         let isPlaying = player.rate != 0
         if playing != isPlaying { playing = isPlaying }
+        // The player stopped by itself during "Play the transition" (not
+        // just for a rebuild, which carries on playing after).
+        if !isPlaying && !swapping && preview.settings.showClips { preview.update { $0.showClips = false } }
         if reversing != (player.rate < 0) { reversing = player.rate < 0 }
         guard isPlaying, !seeking, seekTarget == nil, t.isFinite else { return }
         let frame = snap(t)
@@ -514,6 +601,10 @@ final class TrimController: ObservableObject {
             let back = stopReturn
             pause()
             if let back { seek(back) }
+        } else if player.rate > 0 && t >= duration && !preview.settings.showClips {
+            // The outro makes the player run on past the video; stop at its end.
+            pause()
+            seek(time(lastFrame))
         }
     }
 
@@ -540,9 +631,14 @@ final class TrimController: ObservableObject {
         }
     }
 
-    func play(rate: Float = 1) {
+    /// `showingClips`: "Play the transition", which plays the intro and
+    /// outro outside the part being kept.
+    func play(rate: Float = 1, showingClips: Bool = false) {
         guard ready else { return }
+        transportMoves += 1
+        if !showingClips { transitionRuns += 1 }   // a transition still getting ready doesn't start after all
         stopAt = nil
+        if preview.settings.showClips != showingClips { preview.update { $0.showClips = showingClips } }
         if rate > 0 && frame(current) >= lastFrame { seek(0) }
         player.rate = rate
         playing = true
@@ -550,8 +646,11 @@ final class TrimController: ObservableObject {
     }
 
     func pause() {
+        transportMoves += 1
+        transitionRuns += 1
         stopAt = nil
         playingSection = nil
+        if preview.settings.showClips { preview.update { $0.showClips = false } }
         let wasPlaying = player.rate != 0
         player.pause()
         playing = false
@@ -668,14 +767,14 @@ final class TrimController: ObservableObject {
     var suggestedStart: TrimSuggestion? { suggestions?.starts[safe: startPick] }
     var suggestedEnd: TrimSuggestion? { suggestions?.ends[safe: endPick] }
 
-    /// With the fade on, the suggested cut leaves the fade room in the pause
-    /// (as Jacob cuts it); with it off, or where an intro or outro takes its
-    /// place, half a second from his voice at most.
+    /// With the fade on (or a crossfade to an intro or outro), the suggested
+    /// cut leaves the fade room in the pause (as Jacob cuts it); with a
+    /// straight cut, half a second from his voice at most.
     func startTime(_ s: TrimSuggestion) -> Double {
-        fade && intro == nil ? s.time : max(s.time, s.word - min(0.5, (s.word - s.room) * 0.6))
+        (intro == nil ? fade : introFade > 0) ? s.time : max(s.time, s.word - min(0.5, (s.word - s.room) * 0.6))
     }
     func endTime(_ s: TrimSuggestion) -> Double {
-        fade && outro == nil ? s.time : min(s.time, s.word + min(0.5, (s.room - s.word) * 0.6))
+        (outro == nil ? fade : outroFade > 0) ? s.time : min(s.time, s.word + min(0.5, (s.room - s.word) * 0.6))
     }
 
     func useStart(_ s: TrimSuggestion) {
@@ -790,10 +889,26 @@ final class TrimController: ObservableObject {
         return true
     }
 
-    /// Show the picture with Auto color and the fades (or without), live.
+    /// Show the picture with Auto color and the fades (or without), live,
+    /// and the intro and outro if there are any.
     private func applyLook() {
         guard let item = player.currentItem else { return }
         let table = autoColor ? color.map { ($0.table, $0.space) } : nil
+        if let join = joinPicture {
+            let vc = AVMutableVideoComposition()
+            vc.customVideoCompositorClass = JoinCompositor.self
+            vc.renderSize = join.size
+            vc.frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 600_000)
+            vc.sourceTrackIDForFrameTiming = join.sermon.track
+            vc.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+            vc.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
+            vc.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+            vc.instructions = [JoinInstruction(timeRange: CMTimeRange(start: .zero, duration: join.duration),
+                                               sermon: join.sermon, clips: join.clips, size: join.size,
+                                               state: preview, look: table.map { (table: $0.0, space: $0.1) })]
+            item.videoComposition = vc
+            return
+        }
         guard table != nil || fade else {
             item.videoComposition = nil
             return
@@ -811,7 +926,20 @@ final class TrimController: ObservableObject {
     private func updatePreview() {
         let start = exportStart, end = exportStart + exportLength
         let gain = level ? Float(pow(10, (loudness?.gainDB ?? 0) / 20)) : 1
+        let limit = level && loudness != nil
         let fade = fade, fadeIn = intro == nil, fadeOut = outro == nil
+        let cutIn = inPoint, cutOut = outPoint + frameDuration, rate = fps, kept = keptFrames
+        // Only once the player has the clips (not after falling back to the
+        // plain video, where the sermon would fade towards nothing).
+        let timings = Dictionary(uniqueKeysWithValues: clipPlans.compactMap { plan -> (ClipSlot, ClipTiming)? in
+            guard joinPicture != nil, let c = clip(plan.slot) else { return nil }
+            let n = overlapFrames(plan.slot)
+            let g = clipGain(plan.slot)
+            let at = time(plan.frame)
+            return (plan.slot, ClipTiming(start: at, end: at + Double(clipFrames(c)) / fps, frames: n,
+                                          overlap: Double(n) / fps, gain: g.map { Float(pow(10, $0 / 20)) } ?? 1,
+                                          limit: g != nil))
+        })
         preview.update {
             $0.fade = fade
             $0.fadeIn = fadeIn
@@ -819,6 +947,13 @@ final class TrimController: ObservableObject {
             $0.start = start
             $0.end = end
             $0.gain = gain
+            $0.limit = limit
+            $0.cutIn = cutIn
+            $0.cutOut = cutOut
+            $0.frameRate = rate
+            $0.keptFrames = kept
+            $0.intro = timings[.intro]
+            $0.outro = timings[.outro]
         }
         redrawWaveform()
     }
@@ -831,6 +966,7 @@ final class TrimController: ObservableObject {
         if level {
             levelTask?.cancel()
             levelTask = Task { await measureLevel() }
+            measureClips()
         } else {
             levelGain = nil
             updatePreview()
@@ -906,7 +1042,139 @@ final class TrimController: ObservableObject {
         case .intro: intro = clip
         case .outro: outro = clip
         }
+        if level { measureClips() }
         updatePreview()   // that end of the sermon stops (or starts) fading
+        refreshMusic()    // and the player gets the clip
+    }
+
+    func clip(_ slot: ClipSlot) -> Clip? { slot == .intro ? intro : outro }
+    func crossfade(_ slot: ClipSlot) -> Double { slot == .intro ? introFade : outroFade }
+
+    /// Cut (0) or crossfade (seconds) between the sermon and an intro or outro.
+    func setCrossfade(_ slot: ClipSlot, _ seconds: Double, remember: Bool = true) {
+        guard crossfade(slot) != seconds else { return }
+        switch slot {
+        case .intro: introFade = seconds
+        case .outro: outroFade = seconds
+        }
+        if remember { UserDefaults.standard.set(seconds, forKey: slot.fadeKey) }
+        onChange?()
+        updatePreview()
+        refreshMusic()
+    }
+
+    /// How many frames a clip comes to at the sermon's frame rate: to the
+    /// nearest frame, as the save's frame-rate change makes them.
+    func clipFrames(_ c: Clip) -> Int { max(Int((c.duration * fps + 0.5 + 1e-4).rounded(.down)), 1) }
+
+    /// The crossfade in whole frames, no longer than the clip or half the
+    /// sermon (as the save works it out).
+    func overlapFrames(_ slot: ClipSlot) -> Int {
+        guard let c = clip(slot), crossfade(slot) > 0 else { return 0 }
+        return min(Int(crossfade(slot) * fps + 0.5), clipFrames(c), keptFrames / 2)
+    }
+
+    /// Where each clip goes: the intro ends where its crossfade with the
+    /// sermon does (or right at the start, with a cut), the outro starts
+    /// where its crossfade does (or right after the end).
+    private var clipPlans: [ClipPlan] {
+        let first = frame(inPoint)
+        var plans: [ClipPlan] = []
+        if let c = intro {
+            plans.append(ClipPlan(slot: .intro, url: c.url, frame: first + overlapFrames(.intro) - clipFrames(c)))
+        }
+        if let c = outro {
+            plans.append(ClipPlan(slot: .outro, url: c.url, frame: first + keptFrames - overlapFrames(.outro)))
+        }
+        return plans
+    }
+
+    /// What the save will aim the clips at: the sermon's level, 3 dB higher
+    /// for a one-channel sermon (the save doubles it onto both sides).
+    private var clipTarget: Double {
+        Self.targetLoudness + (sermonMono && !(repair && repairTake != nil) ? 3 : 0)
+    }
+
+    /// A clip's volume change in dB with "Even out the volume" on, once measured.
+    private func clipGain(_ slot: ClipSlot) -> Double? {
+        // Only once the sermon's volume change is known: the save levels the clips only then.
+        guard level, loudness != nil, let c = clip(slot), let lufs = clipLoudness[c.url], lufs > -60 else { return nil }
+        return min(max(clipTarget - lufs, -12), 18)
+    }
+
+    /// Measure each clip's loudness the way the save does (all of its sound,
+    /// a one-channel clip as if on both sides, more channels mixed down to two).
+    private func measureClips() {
+        for c in [intro, outro].compactMap({ $0 }) where clipLoudness[c.url] == nil && !clipMeasuring.contains(c.url) {
+            clipMeasuring.insert(c.url)
+            Task {
+                let track = try? await AVURLAsset(url: c.url).loadTracks(withMediaType: .audio).first
+                var mono = false
+                if let track { mono = await Self.channels(track) == 1 }
+                let lufs = await measureLoudness(c.url, start: 0, length: 86_400, dualMono: mono, stereo: !mono)
+                clipMeasuring.remove(c.url)
+                clipLoudness[c.url] = lufs ?? -.infinity
+                updatePreview()
+            }
+        }
+    }
+
+    nonisolated private static func channels(_ track: AVAssetTrack) async -> Int? {
+        guard let format = try? await track.load(.formatDescriptions).first,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format) else { return nil }
+        return Int(asbd.pointee.mChannelsPerFrame)
+    }
+
+    /// Start "Play the transition": a few seconds either side of where the
+    /// sermon meets the intro or outro, played as it will be saved, then
+    /// back to the start or end.
+    func playTransition(_ slot: ClipSlot) {
+        guard ready, clip(slot) != nil else { return }
+        pause()
+        transitionRuns += 1
+        let run = transitionRuns
+        Task {
+            // The player has to have the clip where it goes now (and a
+            // rebuild can start while waiting for one).
+            var build: Int
+            repeat {
+                build = builds
+                await itemBuild?.value
+                await itemWatch?.value
+            } while build != builds
+            guard run == transitionRuns, !closed, let c = clip(slot) else { return }
+            guard joinPicture?.clips[slot] != nil else { NSSound.beep(); return }
+            let n = Double(overlapFrames(slot)) / fps, length = Double(clipFrames(c)) / fps
+            let cutIn = inPoint, cutOut = outPoint + frameDuration
+            let from: Double, to: Double, back: Double
+            if slot == .intro {
+                from = max(cutIn + n - length, cutIn - 3, 0)
+                to = cutIn + n + 3
+                back = inPoint
+            } else {
+                from = max(cutOut - n - 3, inPoint)
+                to = min(cutOut - n + length - 2 * frameDuration, cutOut + 3)
+                back = outPoint
+            }
+            preview.update { $0.showClips = true }
+            seek(from)
+            play(showingClips: true)
+            stopAt = to
+            stopReturn = back
+        }
+    }
+
+    /// Counts "Play the transition" clicks (and anything else that plays or
+    /// pauses), so a slow one can't start late.
+    private var transitionRuns = 0
+    /// Counts player rebuilds.
+    private var builds = 0
+
+    /// How much of the intro there's no room for before the start (the
+    /// preview starts at the beginning of the video), in seconds.
+    var introCutShort: Double {
+        guard let c = intro else { return 0 }
+        return max(Double(clipFrames(c) - overlapFrames(.intro)) / fps - inPoint, 0)
     }
 
     /// How long a video's picture runs, or nil if it has none.
@@ -920,7 +1188,14 @@ final class TrimController: ObservableObject {
 
     /// Extra arguments for `sermon_captions.py trim`.
     var clipArgs: [String] {
-        (intro.map { ["--intro", $0.url.path] } ?? []) + (outro.map { ["--outro", $0.url.path] } ?? [])
+        var args: [String] = []
+        if let c = intro {
+            args += ["--intro", c.url.path] + (introFade > 0 ? ["--intro-crossfade", "\(introFade)"] : [])
+        }
+        if let c = outro {
+            args += ["--outro", c.url.path] + (outroFade > 0 ? ["--outro-crossfade", "\(outroFade)"] : [])
+        }
+        return args
     }
 
     // MARK: repair
@@ -1107,7 +1382,8 @@ final class TrimController: ObservableObject {
     func outsideTrim(_ m: MusicSection) -> Bool { m.to < inPoint || m.from > outPoint }
 
     /// Pick up the separated audio for each section (or lose it when a
-    /// section moves) and rebuild what the player plays to match.
+    /// section moves) and rebuild what the player plays to match, with the
+    /// intro and outro where they go.
     func refreshMusic() {
         var files: [UUID: URL] = [:]
         for m in sections where FileManager.default.fileExists(atPath: musicPath(m).path) {
@@ -1121,18 +1397,32 @@ final class TrimController: ObservableObject {
             if level { levelChanged() }
         }
         if let take { files[Self.repairID] = take.url }
-        guard files != musicFiles || files != builtFor else { return }
-        builtFor = files
-        musicFiles = files
-        loadMusicWaves()
-        let asset = asset
+        let plans = clipPlans
+        let filesChanged = files != musicFiles || files != builtFor
+        guard filesChanged || plans != builtClips else { return }
+        if filesChanged {
+            builtFor = files
+            musicFiles = files
+            loadMusicWaves()
+        }
+        builtClips = plans
+        let asset = asset, fps = fps
         var parts = sections.compactMap { m in files[m.id].map { (id: m.id, url: $0, at: samples(m).from) } }
         if let take { parts.append((id: Self.repairID, url: take.url, at: Int((take.from * Self.musicRate).rounded()))) }
         itemBuild?.cancel()
+        builds += 1
         itemBuild = Task { [weak self] in
-            var built: (comp: AVComposition, tracks: [UUID: CMPersistentTrackID], sound: CMPersistentTrackID?, lined: Bool)?
-            if !parts.isEmpty { built = await Self.composition(asset, music: parts) }
-            guard let self, !Task.isCancelled, self.musicFiles == files else { return }
+            // Only the intro or outro moved (the start or end is being
+            // dragged or nudged): wait for it to settle.
+            if !filesChanged {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if Task.isCancelled { return }
+            }
+            var built: Built?
+            if !parts.isEmpty || !plans.isEmpty { built = await Self.composition(asset, music: parts, clips: plans, fps: fps) }
+            guard let self, !Task.isCancelled, self.musicFiles == files, self.builtClips == plans else { return }
+            self.joinNote = plans.isEmpty || built?.join != nil ? nil
+                : "Couldn't set up the preview of the intro and outro. Saving still works."
             if parts.isEmpty {
                 self.musicPreviewNote = nil
             } else if let built {
@@ -1142,27 +1432,33 @@ final class TrimController: ObservableObject {
                 self.musicPreviewNote = "Couldn't set up the preview for this video. Saving still works."
             }
             self.swapItem(built.map { AVPlayerItem(asset: $0.comp) } ?? AVPlayerItem(asset: asset),
-                          tracks: built?.tracks ?? [:], sound: built.map { $0.sound } ?? self.assetSoundTrack)
+                          tracks: built?.tracks ?? [:], sound: built.map { $0.sound } ?? self.assetSoundTrack,
+                          join: built?.join)
         }
     }
 
+    typealias Built = (comp: AVComposition, tracks: [UUID: CMPersistentTrackID], sound: CMPersistentTrackID?,
+                       lined: Bool, join: JoinPicture?)
+
     /// The video and its sound, plus each section's separated audio as its
-    /// own track, so switching choices is just that track's volume.
+    /// own track, so switching choices is just that track's volume, and the
+    /// intro and outro as tracks of their own where they go.
     /// `lined` is false if the player's offset from ffmpeg couldn't be measured.
-    nonisolated private static func composition(_ asset: AVURLAsset, music: [(id: UUID, url: URL, at: Int)]) async
-        -> (comp: AVComposition, tracks: [UUID: CMPersistentTrackID], sound: CMPersistentTrackID?, lined: Bool)? {
+    nonisolated private static func composition(_ asset: AVURLAsset, music: [(id: UUID, url: URL, at: Int)],
+                                                clips: [ClipPlan] = [], fps: Double = 30) async -> Built? {
         do {
             let comp = AVMutableComposition()
             let video = try await asset.loadTracks(withMediaType: .video).prefix(1)
             let audio = try await asset.loadTracks(withMediaType: .audio).prefix(1)
             var sound: CMPersistentTrackID?
+            var picture: CMPersistentTrackID?
             for track in video + audio {
                 let range = try await track.load(.timeRange)
                 guard let t = comp.addMutableTrack(withMediaType: track.mediaType,
                                                    preferredTrackID: kCMPersistentTrackID_Invalid) else { return nil }
                 try t.insertTimeRange(range, of: track, at: range.start)
                 t.preferredTransform = try await track.load(.preferredTransform)
-                if track.mediaType == .audio { sound = t.trackID }
+                if track.mediaType == .audio { sound = t.trackID } else { picture = t.trackID }
             }
             // The offset is the same all through a file; any section's reference will do.
             // Measured separately for the repaired voice: its reference is
@@ -1196,10 +1492,142 @@ final class TrimController: ObservableObject {
                 withExtendedLifetime(musicAsset) {}
                 tracks[m.id] = t.trackID
             }
-            return (comp, tracks, sound, offset != nil)
+            // The music preview still works if the intro and outro can't be added.
+            var join: JoinPicture?
+            if !clips.isEmpty, let source = video.first, let picture {
+                join = await addClips(clips, to: comp, sermon: source, id: picture, fps: fps)
+            }
+            if music.isEmpty && join == nil { return nil }
+            return (comp, tracks, sound, offset != nil, join)
         } catch {
             return nil
         }
+    }
+
+    /// Add the intro and outro to the player's composition, each as tracks
+    /// of its own from where its time zero goes. Nil (with nothing added) if
+    /// they can't be.
+    nonisolated private static func addClips(_ clips: [ClipPlan], to comp: AVMutableComposition,
+                                             sermon source: AVAssetTrack, id picture: CMPersistentTrackID,
+                                             fps: Double) async
+        -> JoinPicture? {
+        var added: [AVMutableCompositionTrack] = []
+        do {
+            // Where sermon frame k starts, as the editor counts (k/fps), kept
+            // exact for the usual rates (a whole number of 1/600000 ticks a
+            // frame) so a clip lines up with the frames all through a long sermon.
+            let ticks = 600_000 / fps
+            let exact = abs(ticks - ticks.rounded()) < 1e-3
+            func start(_ k: Int) -> CMTime {
+                exact ? CMTime(value: CMTimeValue(ticks.rounded()) * CMTimeValue(k), timescale: 600_000)
+                      : CMTime(seconds: Double(k) / fps, preferredTimescale: 600_000)
+            }
+            let half = exact ? CMTime(value: CMTimeValue(ticks.rounded()), timescale: 1_200_000)
+                             : CMTime(seconds: 0.5 / fps, preferredTimescale: 600_000)
+            // The saved picture is the sermon's, as shown (any rotation applied).
+            let natural = try await source.load(.naturalSize)
+            let turn = orientation(try await source.load(.preferredTransform))
+            let size = turn.sideways ? CGSize(width: natural.height, height: natural.width) : natural
+            var placed: [ClipSlot: JoinInstruction.Placed] = [:]
+            var clipSound: [ClipSlot: CMPersistentTrackID] = [:]
+            for plan in clips {
+                let clipAsset = AVURLAsset(url: plan.url)
+                for track in try await clipAsset.loadTracks(withMediaType: .video).prefix(1)
+                    + clipAsset.loadTracks(withMediaType: .audio).prefix(1) {
+                    // The picture just under half a frame early: the save's frame-rate
+                    // change shows, at each frame, the clip's frame that started
+                    // before half a frame on (one starting right then waits).
+                    var zero = start(plan.frame)
+                    if track.mediaType == .video { zero = zero - half + CMTime(value: 1, timescale: 600_000) }
+                    var range = try await track.load(.timeRange)
+                    var at = zero + range.start
+                    // A picture that starts after the clip's time zero has its first
+                    // frame held until then, as the save does.
+                    // (A late start can show as an empty edit at the front.)
+                    var hold: CMTimeRange?
+                    if track.mediaType == .video {
+                        var first = range.start
+                        if let segments = try? await track.load(.segments),
+                           let s = segments.first(where: { !$0.isEmpty }) {
+                            first = max(first, s.timeMapping.target.start)
+                        }
+                        if first > .zero && first < range.end && zero + first > .zero {
+                            // A millisecond: shorter than any frame, so only the first one is stretched.
+                            hold = CMTimeRange(start: first, duration: min(CMTime(value: 1, timescale: 1000), range.end - first))
+                        }
+                    }
+                    // Any of it that would land before the video starts is left off.
+                    if at < .zero {
+                        range = CMTimeRange(start: range.start - at, end: range.end)
+                        at = .zero
+                    }
+                    guard range.duration > .zero else { continue }
+                    guard let t = comp.addMutableTrack(withMediaType: track.mediaType,
+                                                       preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                        throw CocoaError(.featureUnsupported)
+                    }
+                    added.append(t)
+                    if let hold {
+                        let start = max(zero, .zero)
+                        try t.insertTimeRange(hold, of: track, at: start)
+                        t.scaleTimeRange(CMTimeRange(start: start, duration: hold.duration), toDuration: zero + hold.end - start)
+                        range = CMTimeRange(start: hold.end, end: range.end)
+                        at = zero + hold.end
+                    }
+                    if range.duration > .zero { try t.insertTimeRange(range, of: track, at: at) }
+                    if track.mediaType == .audio {
+                        clipSound[plan.slot] = t.trackID
+                    } else {
+                        placed[plan.slot] = try await fit(track, into: size, id: t.trackID)
+                    }
+                }
+                withExtendedLifetime(clipAsset) {}
+            }
+            return JoinPicture(size: size, duration: comp.duration,
+                               sermon: .init(track: picture, orientation: turn.orientation,
+                                             rect: CGRect(origin: .zero, size: size)),
+                               clips: placed, sound: clipSound)
+        } catch {
+            for t in added { comp.removeTrack(t) }
+            return nil
+        }
+    }
+
+    /// How a track's frames turn upright, from its transform.
+    nonisolated static func orientation(_ t: CGAffineTransform) -> (orientation: CGImagePropertyOrientation, sideways: Bool) {
+        switch (t.a.rounded(), t.b.rounded(), t.c.rounded(), t.d.rounded()) {
+        case (0, 1, -1, 0): return (.right, true)
+        case (0, -1, 1, 0): return (.left, true)
+        case (-1, 0, 0, -1): return (.down, false)
+        default: return (.up, false)
+        }
+    }
+
+    /// Where a clip's picture goes in the saved picture, as the save puts it:
+    /// pixels made square, then as big as fits (even sizes), centred.
+    nonisolated private static func fit(_ track: AVAssetTrack, into size: CGSize, id: CMPersistentTrackID) async throws
+        -> JoinInstruction.Placed {
+        let natural = try await track.load(.naturalSize)
+        let turn = orientation(try await track.load(.preferredTransform))
+        var aspect = 1.0
+        if let format = try await track.load(.formatDescriptions).first,
+           let par = CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_PixelAspectRatio)
+            as? [String: Any],
+           let h = (par[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing as String] as? NSNumber)?.doubleValue,
+           let v = (par[kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing as String] as? NSNumber)?.doubleValue,
+           h > 0, v > 0 {
+            aspect = h / v
+        }
+        let iw = turn.sideways ? Double(Int(natural.height / aspect / 2) * 2) : Double(Int(natural.width * aspect / 2) * 2)
+        let ih = turn.sideways ? natural.width : natural.height
+        let W = Int(size.width), H = Int(size.height)
+        guard iw > 0, ih > 0 else { return .init(track: id, orientation: turn.orientation, rect: CGRect(origin: .zero, size: size)) }
+        // ffmpeg's force_original_aspect_ratio=decrease:force_divisible_by=2.
+        let w = min(Int((Double(H) * iw / (ih * 2)).rounded()) * 2, W) / 2 * 2
+        let h = min(Int((Double(W) * ih / (iw * 2)).rounded()) * 2, H) / 2 * 2
+        let x = (W - w) / 4 * 2, top = (H - h) / 4 * 2   // ffmpeg's pad keeps them even
+        return .init(track: id, orientation: turn.orientation,
+                     rect: CGRect(x: x, y: H - top - h, width: w, height: h))
     }
 
     /// How many samples ahead of ffmpeg AVFoundation's decode of `track` runs.
@@ -1297,6 +1725,14 @@ final class TrimController: ObservableObject {
             params.append(p)
         }
         for p in params { p.audioTapProcessor = makePreviewTap(preview) }
+        for (slot, id) in joinPicture?.sound ?? [:] {
+            let p = AVMutableAudioMixInputParameters()
+            p.trackID = id
+            let tap = makePreviewTap(preview, clip: slot)
+            p.setVolume(tap == nil ? 0 : 1, at: .zero)   // without its tap nothing would keep it quiet
+            p.audioTapProcessor = tap
+            params.append(p)
+        }
         let mix = AVMutableAudioMix()
         mix.inputParameters = params
         item.audioMix = mix
@@ -1317,7 +1753,8 @@ final class TrimController: ObservableObject {
 
     var points: TrimPoints {
         TrimPoints(inTime: inPoint, outTime: outPoint, fade: fade, level: level, musicSections: sections,
-                   autoColor: autoColor, repair: repair, intro: intro?.url.path, outro: outro?.url.path)
+                   autoColor: autoColor, repair: repair, intro: intro?.url.path, outro: outro?.url.path,
+                   introFade: introFade, outroFade: outroFade)
     }
 
     /// Arguments for `sermon_captions.py trim`: start a quarter frame early and
@@ -1670,7 +2107,7 @@ struct TrimEditor: View {
 
             HStack(spacing: 18) {
                 Toggle("Fade in and out (1 sec)", isOn: $c.fade)
-                    .help("Fades the sermon in at the start and out at the end. Where there's an intro or outro, it cuts straight to it instead.")
+                    .help("Fades the sermon in at the start and out at the end. Where there's an intro or outro, it cuts or crossfades to it instead.")
                 HStack(spacing: 6) {
                     Toggle("Even out the volume", isOn: $c.level)
                         .help("Brings the part you're keeping to a standard loudness, with a limiter for the loudest moments. Turn it on and off to compare.")
@@ -1889,13 +2326,10 @@ struct TrimEditor: View {
     }
 
     private var clipPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 28) {
-                clipSlot(.intro)
-                clipSlot(.outro)
-                Spacer()
-            }
-            if let note = c.clipNote {
+        VStack(alignment: .leading, spacing: 8) {
+            clipSlot(.intro)
+            clipSlot(.outro)
+            ForEach([c.clipNote, c.joinNote, introShortNote].compactMap { $0 }, id: \.self) { note in
                 Label(note, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
             }
         }
@@ -1910,7 +2344,7 @@ struct TrimEditor: View {
         return HStack(spacing: 8) {
             Image(systemName: clip == nil ? "film" : "film.fill")
                 .foregroundStyle(clip == nil ? Color.secondary : Color.accentColor)
-            Text(title).font(.headline)
+            Text(title).font(.headline).frame(width: 46, alignment: .leading)
             if let clip {
                 Text(clip.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                     .frame(maxWidth: 240, alignment: .leading)
@@ -1924,6 +2358,17 @@ struct TrimEditor: View {
                     .popover(isPresented: Binding(get: { watching == slot }, set: { if !$0 && watching == slot { watching = nil } })) {
                         ClipPlayer(url: clip.url)
                     }
+                Picker("", selection: Binding(get: { c.crossfade(slot) }, set: { c.setCrossfade(slot, $0) })) {
+                    ForEach(ClipSlot.fades, id: \.self) { s in
+                        Text(s == 0 ? "Straight cut" : "Crossfade \(s == 0.5 ? "½" : String(format: "%.0f", s)) sec").tag(s)
+                    }
+                }
+                .pickerStyle(.menu).labelsHidden().fixedSize()
+                .help(slot == .intro ? "How the intro goes into the sermon" : "How the sermon goes into the outro")
+                Button { c.playTransition(slot) } label: { Label("Play the transition", systemImage: "play.square") }
+                    .help(slot == .intro ? "Play the end of the intro into the start of the sermon, as it will be saved"
+                                         : "Play the end of the sermon into the outro, as it will be saved")
+                Spacer()
                 Button("Change…") { pickClip(slot) }
                 Button { useClip(slot, nil) } label: { Image(systemName: "trash") }
                     .buttonStyle(.borderless).help("Take the \(slot.name) off")
@@ -1931,6 +2376,7 @@ struct TrimEditor: View {
                 Button("Add \(slot.name)…") { pickClip(slot) }
                     .help(slot == .intro ? "A video to put before the sermon, as it is (or drop one here)"
                                          : "A video to put after the sermon, as it is (or drop one here)")
+                Spacer()
             }
         }
         .dropDestination(for: URL.self) { urls, _ in
@@ -1939,6 +2385,16 @@ struct TrimEditor: View {
             useClip(slot, u)
             return true
         }
+    }
+
+    /// Play the transition can only show the part of the intro that fits
+    /// before the start.
+    private var introShortNote: String? {
+        let short = c.introCutShort
+        guard short >= 0.5 else { return nil }
+        return short >= Double(c.intro.map(c.clipFrames) ?? 0) / c.fps - 0.05
+            ? "The start is too close to the beginning of the video to play the intro before it here. The saved video will have all of it."
+            : "Play the transition leaves off the first \(Int(short.rounded())) sec of the intro here (it doesn't fit before the start). The saved video will have all of it."
     }
 
     private func pickClip(_ slot: ClipSlot) {
