@@ -375,7 +375,7 @@ final class TrimController: ObservableObject {
         itemWatch?.cancel()
         guard let item = player.currentItem else { return }
         itemWatch = Task { [weak self] in
-            for await status in item.publisher(for: \.status).values {
+            for await status in Self.statuses(of: item) {
                 guard let self, !Task.isCancelled else { return }
                 if status != .unknown {
                     self.swapping = false
@@ -412,6 +412,16 @@ final class TrimController: ObservableObject {
                     return
                 }
             }
+        }
+    }
+
+    /// Every status an item goes through, starting with the one it has now.
+    /// (Not `publisher(for:).values`: that drops a change that comes while
+    /// the last one is still being handled, so it could miss "ready".)
+    nonisolated private static func statuses(of item: AVPlayerItem) -> AsyncStream<AVPlayerItem.Status> {
+        AsyncStream { go in
+            let watch = item.observe(\.status, options: [.initial, .new]) { item, _ in go.yield(item.status) }
+            go.onTermination = { _ in watch.invalidate() }
         }
     }
 
